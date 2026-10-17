@@ -1,2 +1,2 @@
-# reactor-audio-visualizer-regl
+# reactor-audio-visualizer-webgl重写
 以切尔诺贝利反应堆堆芯的控制棒阵列为视觉原型的实时音频可视化实验(WebGL重写)。
