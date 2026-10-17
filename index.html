@@ -13,10 +13,9 @@
 <body>
 <!--
 <div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;user-select:none;z-index:9999">
-  <span style="display:inline-block;transform:translateX(-130px);font:700 64px/1 'Arial Black','PingFang SC',sans-serif;color:rgba(222,236,149,0.18);letter-spacing:8px;text-shadow:0 0 24px rgba(222,236,149,0.25);white-space:nowrap">点亮灯泡/tol127的二改版</span>
+  <span style="display:inline-block;transform:translateX(-130px);font:700 64px/1 'Arial Black','PingFang SC',sans-serif;color:rgba(222,236,149,0.18);letter-spacing:8px;text-shadow:0 0 24px rgba(222,236,149,0.25);white-space:nowrap">点亮灯泡的二改版</span>
 </div>
-  -->
-
+-->
   <header>
     <a class="brand" href="./">
       <span class="brand-icon">▦</span> REACTOR
@@ -32,11 +31,13 @@
       <div class="stage-title">
         <div class="title-row">
           <div class="eyebrow">REAL-TIME AUDIO VISUALIZER</div>
-          <div class="bloom-bar">
-            <span>Bloom Type: <b id="bloomMode">—</b></span>
-            <span>Bloom Level: <b id="bloomLevels">—</b></span>
-            <span>FPS: <b id="fps">—</b></span>
-            <span>FFT Size: <b id="fftSize">—</b></span>
+          <div class="state-bar">
+            <!--<span>Bloom Type: <b id="bloomMode">—</b></span>-->
+            <span>Bloom:<b id="bloomLevels">—</b></span>
+            <!--<span>FFT Size: <b id="fftSize">—</b></span>-->
+            <span>SSAA:<b id="ssaa">—</b></span>
+            <span>MSAA:<b id="msaa">—</b></span>
+            <span>FPS:<b id="fps">60</b></span>
           </div>
         </div>
         <h1>声场反应堆<span> / CORE 01 (点亮灯泡二改)</span></h1>

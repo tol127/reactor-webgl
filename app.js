@@ -23,9 +23,8 @@ let fpsLast = 0, fpsFrames = 0;
 const FFTSize = 2048;
 // ★★★ 开关：true = 多级，false = 单级 ★★★
 const MultiBloom = false;
-const FBO_SS = 2;
-//不用了
-//const FBO_Mipmap = true;
+const FBO_SS = 1;   //SSAA
+const FBO_MS = 4;   //MSAA
 
 /* ============================================================
  *  控制棒数据
@@ -98,7 +97,7 @@ const A = {
 };
 
 /* ============================================================
- *  Bloom 后处理模块
+ *  Bloom 后处理模块（含 SSAA + MSAA）
  * ============================================================ */
 const Bloom = (function () {
 
@@ -116,17 +115,23 @@ const Bloom = (function () {
   // 单级用
   let fboBright = null, fboBlur = null;
 
-  // 场景 FBO（共用）
+  // 场景 FBO（SSAA 后的普通纹理，也是 MSAA resolve 目标）
   let fboScene = null;
+  // 场景 MSAA FBO（多重采样渲染目标）
+  let fboSceneMS = null;
 
-  //let progBright = null, progBlur = null, progComposite = null;
   let progBright = null, progBlur = null;
+  let progCompositeMulti = null;
+  let progCompositeSingle = null;
   let quadBuf = null;
 
   let threshold = 0.45;
   let intensity = 1.6;
   let radius = 2.5;
   let sceneHasAlpha = true;
+
+  let msaaEnabled = false;
+  let msaaSamples = 1;
 
   /* ---------- Shader ---------- */
 
@@ -221,9 +226,6 @@ const Bloom = (function () {
       fragColor = vec4(color, scene.a);
     }`;
 
-  let progCompositeMulti = null;
-  let progCompositeSingle = null;
-
   /* ---------- 工具函数 ---------- */
 
   function compile2(type, src) {
@@ -245,31 +247,58 @@ const Bloom = (function () {
     return p;
   }
 
-function createFBO(w, h) {
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  /* ---------- 普通纹理 FBO ---------- */
 
-  // 纯双三次：不需要 mipmap，LINEAR 即可
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  function createFBO(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
 
-  const fbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-  if (status !== gl.FRAMEBUFFER_COMPLETE)
-    throw new Error('FBO incomplete: 0x' + status.toString(16));
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  return { fbo, tex, w, h };
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE)
+      throw new Error('FBO incomplete: 0x' + status.toString(16));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex, w, h };
   }
 
   function destroyFBO(f) {
     if (!f) return;
     gl.deleteFramebuffer(f.fbo);
     gl.deleteTexture(f.tex);
+  }
+
+  /* ---------- 多重采样 FBO（MSAA） ---------- */
+
+  function createMSFBO(w, h, samples) {
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+
+    const colorRB = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, colorRB);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, colorRB);
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE)
+      throw new Error('MS FBO incomplete: 0x' + status.toString(16));
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+    return { fbo, colorRB, w, h, samples };
+  }
+
+  function destroyMSFBO(f) {
+    if (!f) return;
+    gl.deleteFramebuffer(f.fbo);
+    gl.deleteRenderbuffer(f.colorRB);
   }
 
   function bindTexture(tex, unit) {
@@ -318,7 +347,6 @@ function createFBO(w, h) {
     progBlur = link(VS_QUAD, FS_BLUR);
     progCompositeMulti = link(VS_QUAD, FS_COMPOSITE_MULTI);
     progCompositeSingle = link(VS_QUAD, FS_COMPOSITE_SINGLE);
-    //progComposite = MULTI_LEVEL ? progCompositeMulti : progCompositeSingle;
 
     quadBuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
@@ -334,6 +362,8 @@ function createFBO(w, h) {
     width = w; height = h;
 
     destroyFBO(fboScene);
+    destroyMSFBO(fboSceneMS);
+    fboSceneMS = null;
     destroyFBO(fboBright);
     destroyFBO(fboBlur);
     bloomFBOs.forEach(destroyFBO);
@@ -341,9 +371,20 @@ function createFBO(w, h) {
     bloomFBOs = [];
     blurFBOs = [];
 
-    // 场景 FBO 2× 超采样
+    // 场景 SSAA 尺寸
     const SS = FBO_SS;
-    fboScene = createFBO(width * SS, height * SS);
+    const sw = Math.max(1, Math.round(width * SS));
+    const sh = Math.max(1, Math.round(height * SS));
+
+    // SSAA 目标纹理（resolve 后作为 Bloom 输入）
+    fboScene = createFBO(sw, sh);
+
+    // MSAA 实际渲染目标（与 fboScene 同尺寸，1:1 blit）
+    msaaSamples = Math.max(1, Math.min(FBO_MS, gl.getParameter(gl.MAX_SAMPLES)));
+    msaaEnabled = msaaSamples > 1;
+    if (msaaEnabled) {
+      fboSceneMS = createMSFBO(sw, sh, msaaSamples);
+    }
 
     if (MULTI_LEVEL) {
       for (let i = 0; i < LEVELS; i++) {
@@ -362,8 +403,9 @@ function createFBO(w, h) {
   }
 
   function beginScene() {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene.fbo);
-    gl.viewport(0, 0, fboScene.w, fboScene.h);
+    const target = msaaEnabled ? fboSceneMS : fboScene;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    gl.viewport(0, 0, target.w, target.h);
     if (sceneHasAlpha) {
       gl.clearColor(0, 0, 0, 0);
     } else {
@@ -373,6 +415,19 @@ function createFBO(w, h) {
   }
 
   function endScene() {
+    // MSAA resolve → fboScene
+    if (msaaEnabled) {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboSceneMS.fbo);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fboScene.fbo);
+      gl.blitFramebuffer(
+        0, 0, fboSceneMS.w, fboSceneMS.h,
+        0, 0, fboScene.w, fboScene.h,
+        gl.COLOR_BUFFER_BIT, gl.NEAREST
+      );
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    }
+
     if (MULTI_LEVEL) {
       endSceneMulti();
     } else {
@@ -474,9 +529,14 @@ function createFBO(w, h) {
     if (p.radius !== undefined) radius = p.radius;
   }
 
-  return { init, resize, beginScene, endScene, setParams,
-         get mode()  { return MULTI_LEVEL ? 'Multi' : 'Single'; },
-         get levels(){ return MULTI_LEVEL ? LEVELS : 1; } };
+  return { 
+    init, resize, beginScene, endScene, setParams,
+    //get mode()  { return MULTI_LEVEL ? 'Multi' : 'Single'; },
+    get levels(){ return MULTI_LEVEL ? LEVELS : 1; },
+    get ssaa()  { return FBO_SS; },
+    get msaa()  { return msaaSamples; } 
+  };
+  
 })();
 
 /* ============================================================
@@ -1122,10 +1182,12 @@ window.addEventListener('pagehide', stop);
  * ============================================================ */
 size();
 requestAnimationFrame(frame);
-$('bloomMode').textContent   = Bloom.mode;
-$('bloomLevels').textContent = Bloom.levels;
-$('fftSize').textContent = FFTSize
-$('fps').textContent = '60';
+
+$('ssaa').textContent = Bloom.ssaa + 'x';
+$('msaa').textContent = Bloom.msaa + 'x';
+//$('bloomMode').textContent   = Bloom.mode;
+$('bloomLevels').textContent = Bloom.levels + 'x';
+//$('fftSize').textContent = FFTSize
 update();
 
 
