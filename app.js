@@ -643,7 +643,7 @@ function pushQuad(p1, p2, p3, p4, col) {
 
 // 圆盘近似（用三角扇形），用于精细圆点
 function pushDisc(cx, cy, rx, ry, col, SEG) {
-  SEG = SEG || 16;
+  SEG = SEG || 24;
   for (let i = 0; i < SEG; i++) {
     const a0 = i / SEG * Math.PI * 2;
     const a1 = (i + 1) / SEG * Math.PI * 2;
@@ -845,7 +845,7 @@ function frame(t) {
 
     // 圆点（精细圆盘）
     const cp = project(x, z, h + 0.01);
-    pushDisc(cp[0], cp[1], dotSize, dotSize * tilt, COL.rodDot, 12);
+    pushDisc(cp[0], cp[1], dotSize, dotSize * tilt, COL.rodDot, 24);
   }
 
   vertexCount = vp / 6;
