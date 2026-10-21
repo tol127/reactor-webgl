@@ -21,10 +21,11 @@ let smoothPeakIndex = 0;
 let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
 const FFTSize = 2048;
-// ★★★ 开关：true = 多级，false = 单级 ★★★
-const MultiBloom = false;
-const FBO_SS = 1;   //SSAA
-const FBO_MS = 4;   //MSAA
+//下面的参数自己改
+const FBO_Bloom = 1;    //Bloom泛光 1-4
+const FBO_SS = 1;   //SSAA 1-inf
+const FBO_MS = 4;   //MSAA 1-inf
+const LOOP = false;  //循环播放
 
 /* ============================================================
  *  控制棒数据
@@ -98,19 +99,20 @@ const A = {
 
 /* ============================================================
  *  Bloom 后处理模块（含 SSAA + MSAA）
+ *  FBO_Bloom: 1=单级, 2~4=多级（层数=数值）
  * ============================================================ */
 const Bloom = (function () {
 
   let gl = null;
   let width = 1, height = 1;
 
-  // ★★★ 开关：true = 多级，false = 单级 ★★★
-  const MULTI_LEVEL = MultiBloom;
+  // ★★★ 1=单级，2~4=多级，数值即层数，最高 4 ★★★
+  const LEVELS      = Math.max(1, Math.min(4, FBO_Bloom | 0));
+  const MULTI_LEVEL = LEVELS > 1;
 
-  // 多级用
-  const LEVELS = 4;
+  // 多级用（最多 4 个）
   let bloomFBOs = [];
-  let blurFBOs = [];
+  let blurFBOs  = [];
 
   // 单级用
   let fboBright = null, fboBlur = null;
@@ -124,6 +126,7 @@ const Bloom = (function () {
   let progCompositeMulti = null;
   let progCompositeSingle = null;
   let quadBuf = null;
+  let nullTex = null;   // 1x1 黑色占位纹理（补齐未使用的 sampler）
 
   let threshold = 0.45;
   let intensity = 1.6;
@@ -182,7 +185,7 @@ const Bloom = (function () {
       fragColor = vec4(result, 1.0);
     }`;
 
-  // 多级合成
+  // 多级合成：固定 4 个 sampler，用 uLevels 屏蔽未使用的层
   const FS_COMPOSITE_MULTI = `#version 300 es
     precision mediump float;
     in vec2 vUV;
@@ -192,17 +195,17 @@ const Bloom = (function () {
     uniform sampler2D uBloom2;
     uniform sampler2D uBloom3;
     uniform float uIntensity;
+    uniform int uLevels;
     out vec4 fragColor;
     void main(){
       vec4 scene = texture(uScene, vUV);
-      // 权重和 > 1，叠加而非平均
-      vec3 b = texture(uBloom0, vUV).rgb * 0.9
-             + texture(uBloom1, vUV).rgb * 0.5
-             + texture(uBloom2, vUV).rgb * 0.3
-             + texture(uBloom3, vUV).rgb * 0.15;
+      vec3 b = vec3(0.0);
+      b += texture(uBloom0, vUV).rgb * 0.9;
+      if (uLevels > 1) b += texture(uBloom1, vUV).rgb * 0.3;
+      if (uLevels > 2) b += texture(uBloom2, vUV).rgb * 0.2;
+      if (uLevels > 3) b += texture(uBloom3, vUV).rgb * 0.15;
       b *= scene.a;
       vec3 color = scene.rgb + b * uIntensity;
-      // 轻量 tone mapping
       float maxC = max(max(color.r, color.g), color.b);
       color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
       fragColor = vec4(color, scene.a);
@@ -344,9 +347,9 @@ const Bloom = (function () {
     if (opts && opts.sceneHasAlpha !== undefined) sceneHasAlpha = opts.sceneHasAlpha;
 
     progBright = link(VS_QUAD, FS_BRIGHT);
-    progBlur = link(VS_QUAD, FS_BLUR);
-    progCompositeMulti = link(VS_QUAD, FS_COMPOSITE_MULTI);
-    progCompositeSingle = link(VS_QUAD, FS_COMPOSITE_SINGLE);
+    progBlur   = link(VS_QUAD, FS_BLUR);
+    progCompositeMulti  = MULTI_LEVEL ? link(VS_QUAD, FS_COMPOSITE_MULTI)  : null;
+    progCompositeSingle = MULTI_LEVEL ? null : link(VS_QUAD, FS_COMPOSITE_SINGLE);
 
     quadBuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
@@ -354,6 +357,16 @@ const Bloom = (function () {
       -1, -1,  1, -1, -1,  1,
       -1,  1,  1, -1,  1,  1,
     ]), gl.STATIC_DRAW);
+
+    // 1x1 黑色占位纹理（用于补齐未使用的 sampler）
+    nullTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, nullTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+                  new Uint8Array([0, 0, 0, 255]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
     resize(w, h);
   }
@@ -369,11 +382,11 @@ const Bloom = (function () {
     bloomFBOs.forEach(destroyFBO);
     blurFBOs.forEach(destroyFBO);
     bloomFBOs = [];
-    blurFBOs = [];
+    blurFBOs  = [];
 
     // 场景 SSAA 尺寸
     const SS = FBO_SS;
-    const sw = Math.max(1, Math.round(width * SS));
+    const sw = Math.max(1, Math.round(width  * SS));
     const sh = Math.max(1, Math.round(height * SS));
 
     // SSAA 目标纹理（resolve 后作为 Bloom 输入）
@@ -389,16 +402,16 @@ const Bloom = (function () {
     if (MULTI_LEVEL) {
       for (let i = 0; i < LEVELS; i++) {
         const div = Math.pow(2, i + 1);
-        const bw = Math.max(1, Math.floor(width / div));
+        const bw = Math.max(1, Math.floor(width  / div));
         const bh = Math.max(1, Math.floor(height / div));
         bloomFBOs.push(createFBO(bw, bh));
         blurFBOs.push(createFBO(bw, bh));
       }
     } else {
-      const bw = Math.max(1, Math.floor(width / 2));
+      const bw = Math.max(1, Math.floor(width  / 2));
       const bh = Math.max(1, Math.floor(height / 2));
       fboBright = createFBO(bw, bh);
-      fboBlur = createFBO(bw, bh);
+      fboBlur   = createFBO(bw, bh);
     }
   }
 
@@ -421,18 +434,15 @@ const Bloom = (function () {
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fboScene.fbo);
       gl.blitFramebuffer(
         0, 0, fboSceneMS.w, fboSceneMS.h,
-        0, 0, fboScene.w, fboScene.h,
+        0, 0, fboScene.w,   fboScene.h,
         gl.COLOR_BUFFER_BIT, gl.NEAREST
       );
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
     }
 
-    if (MULTI_LEVEL) {
-      endSceneMulti();
-    } else {
-      endSceneSingle();
-    }
+    if (MULTI_LEVEL) endSceneMulti();
+    else             endSceneSingle();
   }
 
   /* ---- 多级 ---- */
@@ -450,7 +460,7 @@ const Bloom = (function () {
     // Pass 2: 逐级
     for (let i = 0; i < LEVELS; i++) {
       if (i > 0) {
-        const cur = bloomFBOs[i];
+        const cur  = bloomFBOs[i];
         const prev = bloomFBOs[i - 1];
         gl.bindFramebuffer(gl.FRAMEBUFFER, cur.fbo);
         gl.viewport(0, 0, cur.w, cur.h);
@@ -463,20 +473,22 @@ const Bloom = (function () {
       blurLevel(i, radius);
     }
 
-    // Pass 3: 合成
+    // Pass 3: 合成（固定 4 个 sampler，缺失绑 nullTex）
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, width, height);
     gl.useProgram(progCompositeMulti);
+
     bindTexture(fboScene.tex, 0);
-    bindTexture(bloomFBOs[0].tex, 1);
-    bindTexture(bloomFBOs[1].tex, 2);
-    bindTexture(bloomFBOs[2].tex, 3);
-    bindTexture(bloomFBOs[3].tex, 4);
     gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uScene'), 0);
-    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom0'), 1);
-    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom1'), 2);
-    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom2'), 3);
-    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom3'), 4);
+
+    for (let i = 0; i < 4; i++) {
+      const unit = i + 1;
+      const tex  = i < LEVELS ? bloomFBOs[i].tex : nullTex;
+      bindTexture(tex, unit);
+      gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom' + i), unit);
+    }
+
+    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uLevels'), LEVELS);
     gl.uniform1f(gl.getUniformLocation(progCompositeMulti, 'uIntensity'), intensity);
     drawQuad(progCompositeMulti);
   }
@@ -529,14 +541,14 @@ const Bloom = (function () {
     if (p.radius !== undefined) radius = p.radius;
   }
 
-  return { 
+  return {
     init, resize, beginScene, endScene, setParams,
-    //get mode()  { return MULTI_LEVEL ? 'Multi' : 'Single'; },
+    get mode()  { return MULTI_LEVEL ? 'Multi' : 'Single'; },
     get levels(){ return MULTI_LEVEL ? LEVELS : 1; },
     get ssaa()  { return FBO_SS; },
-    get msaa()  { return msaaSamples; } 
+    get msaa()  { return msaaSamples; }
   };
-  
+
 })();
 
 /* ============================================================
@@ -889,9 +901,12 @@ function frame(t) {
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
     $('freq').innerHTML = (playing && peak > 0 ? Math.round(smoothPeakIndex * binHz) : '—') + '<small>Hz</small>';
     if (playing && !seeking) {
-      const seconds = offset + ctx.currentTime - started;
+      let seconds = offset + ctx.currentTime - started;
+              if (buffer && mode === 'file') {
+            seconds = seconds % buffer.duration;   // ← 进度循环
+        $('seek').value = seconds / buffer.duration * 100;
+      }
       $('elapsed').textContent = format(seconds);
-      if (buffer && mode === 'file') $('seek').value = seconds / buffer.duration * 100;
     }
   }
 
@@ -979,17 +994,18 @@ async function start() {
       master.gain.value = +$('volume').value / 100;
 
       if (mode === 'file' && buffer) {
-        if (offset >= buffer.duration) offset = 0;
-        source = ctx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(analyser);
-        source.onended = () => {
-          stop();
-          offset = 0;
-          $('seek').value = 0;
-          $('elapsed').textContent = '00:00';
-        };
-        source.start(0, offset);
+      source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.loop = LOOP;                    // ← 循环开关
+      source.connect(analyser);
+      source.onended = () => {
+        if (LOOP) return;                    // 循环时不走停止逻辑
+        stop();
+        offset = 0;
+        $('seek').value = 0;
+        $('elapsed').textContent = '00:00';
+      };
+      source.start(0, offset);
       } else {
         [55, 82.41, 110, 164.81, 220, 329.63, 440, 659.25].forEach((freq, i) => {
           const osc = ctx.createOscillator();
