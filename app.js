@@ -23,9 +23,9 @@ let fpsLast = 0, fpsFrames = 0;
 const FFTSize = 2048;
 //下面的参数自己改
 const FBO_Bloom = 1;    //Bloom泛光 1-4
-const FBO_SS = 1;   //SSAA 1-inf
-const FBO_MS = 4;   //MSAA 1-inf
-const LOOP = false;  //循环播放
+const FBO_SS = 2;   //SSAA 1-inf
+const FBO_MS = 1;   //MSAA 1-inf
+let LOOP = false;  //循环播放
 
 /* ============================================================
  *  控制棒数据
@@ -107,7 +107,8 @@ const Bloom = (function () {
   let width = 1, height = 1;
 
   // ★★★ 1=单级，2~4=多级，数值即层数，最高 4 ★★★
-  const LEVELS      = Math.max(1, Math.min(4, FBO_Bloom | 0));
+  //const LEVELS      = Math.max(1, Math.min(4, FBO_Bloom | 0));  //现在支持无bloom
+  const LEVELS      = FBO_Bloom ;
   const MULTI_LEVEL = LEVELS > 1;
 
   // 多级用（最多 4 个）
@@ -383,6 +384,15 @@ const Bloom = (function () {
     blurFBOs.forEach(destroyFBO);
     bloomFBOs = [];
     blurFBOs  = [];
+    
+    // Bloom 关闭：不建任何场景/Bloom FBO，直接画默认 framebuffer
+    if (LEVELS === 0) {
+      msaaSamples = 1;
+      msaaEnabled = false;
+      fboScene = null;
+      fboSceneMS = null;
+      return;
+    }
 
     // 场景 SSAA 尺寸
     const SS = FBO_SS;
@@ -416,6 +426,14 @@ const Bloom = (function () {
   }
 
   function beginScene() {
+    if (LEVELS === 0) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, width, height);
+      if (sceneHasAlpha) gl.clearColor(0, 0, 0, 0);
+      else gl.clearColor(0.071, 0.086, 0.078, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      return;
+    }
     const target = msaaEnabled ? fboSceneMS : fboScene;
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
     gl.viewport(0, 0, target.w, target.h);
@@ -428,6 +446,7 @@ const Bloom = (function () {
   }
 
   function endScene() {
+    if (LEVELS === 0) return;
     // MSAA resolve → fboScene
     if (msaaEnabled) {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboSceneMS.fbo);
