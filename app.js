@@ -25,7 +25,7 @@ const FFTSize = 2048;
 const FBO_Bloom = 1;    //Bloom泛光 1-4
 const FBO_SS = 2;   //SSAA 1-inf
 const FBO_MS = 1;   //MSAA 1-inf
-let LOOP = false;  //循环播放
+let LOOP = true;  //循环播放
 
 /* ============================================================
  *  控制棒数据
