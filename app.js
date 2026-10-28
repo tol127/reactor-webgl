@@ -21,10 +21,9 @@ let smoothPeakIndex = 0;
 let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
 const FFTSize = 2048;
-//下面的参数自己改
 const FBO_Bloom = 1;    //Bloom泛光 1-4
 const FBO_SS = 2;   //SSAA 1-inf
-const FBO_MS = 1;   //MSAA 1-inf
+//const FBO_MS = 4;   //MSAA 1-inf 没用
 let LOOP = true;  //循环播放
 
 /* ============================================================
@@ -97,8 +96,9 @@ const A = {
   color: gl.getAttribLocation(prog, 'aColor')
 };
 
+
 /* ============================================================
- *  Bloom 后处理模块（含 SSAA + MSAA）
+ *  Bloom 后处理模块（仅 SSAA）
  *  FBO_Bloom: 1=单级, 2~4=多级（层数=数值）
  * ============================================================ */
 const Bloom = (function () {
@@ -106,36 +106,24 @@ const Bloom = (function () {
   let gl = null;
   let width = 1, height = 1;
 
-  // ★★★ 1=单级，2~4=多级，数值即层数，最高 4 ★★★
-  //const LEVELS      = Math.max(1, Math.min(4, FBO_Bloom | 0));  //现在支持无bloom
-  const LEVELS      = FBO_Bloom ;
-  const MULTI_LEVEL = LEVELS > 1;
+  // ★★★ 开关：1 = 单级，2~4 = 多级层数 ★★★
+  const MULTI_LEVEL = FBO_Bloom > 1;
+  const LEVELS = MULTI_LEVEL ? Math.min(Math.max(FBO_Bloom, 2), 4) : 0;
 
-  // 多级用（最多 4 个）
   let bloomFBOs = [];
-  let blurFBOs  = [];
-
-  // 单级用
+  let blurFBOs = [];
   let fboBright = null, fboBlur = null;
-
-  // 场景 FBO（SSAA 后的普通纹理，也是 MSAA resolve 目标）
   let fboScene = null;
-  // 场景 MSAA FBO（多重采样渲染目标）
-  let fboSceneMS = null;
 
   let progBright = null, progBlur = null;
   let progCompositeMulti = null;
   let progCompositeSingle = null;
   let quadBuf = null;
-  let nullTex = null;   // 1x1 黑色占位纹理（补齐未使用的 sampler）
 
   let threshold = 0.45;
   let intensity = 1.6;
   let radius = 2.5;
   let sceneHasAlpha = true;
-
-  let msaaEnabled = false;
-  let msaaSamples = 1;
 
   /* ---------- Shader ---------- */
 
@@ -186,7 +174,7 @@ const Bloom = (function () {
       fragColor = vec4(result, 1.0);
     }`;
 
-  // 多级合成：固定 4 个 sampler，用 uLevels 屏蔽未使用的层
+  // 多级合成（固定 4 个 sampler，用权重 uniform 控制实际层数）
   const FS_COMPOSITE_MULTI = `#version 300 es
     precision mediump float;
     in vec2 vUV;
@@ -195,16 +183,15 @@ const Bloom = (function () {
     uniform sampler2D uBloom1;
     uniform sampler2D uBloom2;
     uniform sampler2D uBloom3;
+    uniform float uW0, uW1, uW2, uW3;
     uniform float uIntensity;
-    uniform int uLevels;
     out vec4 fragColor;
     void main(){
       vec4 scene = texture(uScene, vUV);
-      vec3 b = vec3(0.0);
-      b += texture(uBloom0, vUV).rgb * 0.9;
-      if (uLevels > 1) b += texture(uBloom1, vUV).rgb * 0.3;
-      if (uLevels > 2) b += texture(uBloom2, vUV).rgb * 0.2;
-      if (uLevels > 3) b += texture(uBloom3, vUV).rgb * 0.15;
+      vec3 b = texture(uBloom0, vUV).rgb * uW0
+             + texture(uBloom1, vUV).rgb * uW1
+             + texture(uBloom2, vUV).rgb * uW2
+             + texture(uBloom3, vUV).rgb * uW3;
       b *= scene.a;
       vec3 color = scene.rgb + b * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
@@ -212,7 +199,6 @@ const Bloom = (function () {
       fragColor = vec4(color, scene.a);
     }`;
 
-  // 单级合成
   const FS_COMPOSITE_SINGLE = `#version 300 es
     precision mediump float;
     in vec2 vUV;
@@ -251,7 +237,384 @@ const Bloom = (function () {
     return p;
   }
 
-  /* ---------- 普通纹理 FBO ---------- */
+  function createFBO(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE)
+      throw new Error('FBO incomplete: 0x' + status.toString(16));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex, w, h };
+  }
+
+  function destroyFBO(f) {
+    if (!f) return;
+    gl.deleteFramebuffer(f.fbo);
+    gl.deleteTexture(f.tex);
+  }
+
+  function bindTexture(tex, unit) {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+  }
+
+  function drawQuad(p) {
+    const loc = gl.getAttribLocation(p, 'aPos');
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disableVertexAttribArray(loc);
+  }
+
+  function blurLevel(i, r) {
+    const src = bloomFBOs[i];
+    const tmp = blurFBOs[i];
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, tmp.fbo);
+    gl.viewport(0, 0, tmp.w, tmp.h);
+    gl.useProgram(progBlur);
+    bindTexture(src.tex, 0);
+    gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
+    gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), r / tmp.w, 0);
+    drawQuad(progBlur);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, src.fbo);
+    gl.viewport(0, 0, src.w, src.h);
+    bindTexture(tmp.tex, 0);
+    gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
+    gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), 0, r / src.h);
+    drawQuad(progBlur);
+  }
+
+  /* ---------- 公开 API ---------- */
+
+  function init(glCtx, w, h, opts) {
+    gl = glCtx;
+    if (opts && opts.sceneHasAlpha !== undefined) sceneHasAlpha = opts.sceneHasAlpha;
+
+    progBright = link(VS_QUAD, FS_BRIGHT);
+    progBlur = link(VS_QUAD, FS_BLUR);
+    progCompositeMulti = link(VS_QUAD, FS_COMPOSITE_MULTI);
+    progCompositeSingle = link(VS_QUAD, FS_COMPOSITE_SINGLE);
+
+    quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1,  1, -1, -1,  1,
+      -1,  1,  1, -1,  1,  1,
+    ]), gl.STATIC_DRAW);
+
+    resize(w, h);
+  }
+
+  function resize(w, h) {
+    width = w; height = h;
+
+    destroyFBO(fboScene);
+    destroyFBO(fboBright);
+    destroyFBO(fboBlur);
+    bloomFBOs.forEach(destroyFBO);
+    blurFBOs.forEach(destroyFBO);
+    bloomFBOs = [];
+    blurFBOs = [];
+
+    const SS = FBO_SS;
+    const sw = Math.max(1, Math.round(width * SS));
+    const sh = Math.max(1, Math.round(height * SS));
+    fboScene = createFBO(sw, sh);
+
+    if (MULTI_LEVEL) {
+      for (let i = 0; i < LEVELS; i++) {
+        const div = Math.pow(2, i + 1);
+        const bw = Math.max(1, Math.floor(width / div));
+        const bh = Math.max(1, Math.floor(height / div));
+        bloomFBOs.push(createFBO(bw, bh));
+        blurFBOs.push(createFBO(bw, bh));
+      }
+    } else {
+      const bw = Math.max(1, Math.floor(width / 2));
+      const bh = Math.max(1, Math.floor(height / 2));
+      fboBright = createFBO(bw, bh);
+      fboBlur = createFBO(bw, bh);
+    }
+  }
+
+  function beginScene() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboScene.fbo);
+    gl.viewport(0, 0, fboScene.w, fboScene.h);
+    if (sceneHasAlpha) {
+      gl.clearColor(0, 0, 0, 0);
+    } else {
+      gl.clearColor(0.071, 0.086, 0.078, 1);
+    }
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+
+  function endScene() {
+    if (MULTI_LEVEL) endSceneMulti();
+    else endSceneSingle();
+  }
+
+  function endSceneMulti() {
+    // Pass 1: 亮度提取 → bloom0
+    const b0 = bloomFBOs[0];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, b0.fbo);
+    gl.viewport(0, 0, b0.w, b0.h);
+    gl.useProgram(progBright);
+    bindTexture(fboScene.tex, 0);
+    gl.uniform1i(gl.getUniformLocation(progBright, 'uScene'), 0);
+    gl.uniform1f(gl.getUniformLocation(progBright, 'uThreshold'), threshold);
+    drawQuad(progBright);
+
+    // Pass 2: 逐级
+    for (let i = 0; i < LEVELS; i++) {
+      if (i > 0) {
+        const cur = bloomFBOs[i];
+        const prev = bloomFBOs[i - 1];
+        gl.bindFramebuffer(gl.FRAMEBUFFER, cur.fbo);
+        gl.viewport(0, 0, cur.w, cur.h);
+        gl.useProgram(progBlur);
+        bindTexture(prev.tex, 0);
+        gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
+        gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), 0, 0);
+        drawQuad(progBlur);
+      }
+      blurLevel(i, radius);
+    }
+
+    // Pass 3: 合成（按 LEVELS 设置权重，多余层权重 0）
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, width, height);
+    gl.useProgram(progCompositeMulti);
+
+    bindTexture(fboScene.tex, 0);
+    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uScene'), 0);
+
+    const weights = [0.9, 0.5, 0.3, 0.15];
+    for (let i = 0; i < 4; i++) {
+      // 层数不足时绑到 bloom0，并把权重设为 0
+      const tex = i < LEVELS ? bloomFBOs[i].tex : bloomFBOs[0].tex;
+      bindTexture(tex, i + 1);
+      gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom' + i), i + 1);
+      gl.uniform1f(gl.getUniformLocation(progCompositeMulti, 'uW' + i),
+                   i < LEVELS ? weights[i] : 0);
+    }
+    gl.uniform1f(gl.getUniformLocation(progCompositeMulti, 'uIntensity'), intensity);
+    drawQuad(progCompositeMulti);
+  }
+
+  function endSceneSingle() {
+    const bw = fboBright.w, bh = fboBright.h;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboBright.fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.useProgram(progBright);
+    bindTexture(fboScene.tex, 0);
+    gl.uniform1i(gl.getUniformLocation(progBright, 'uScene'), 0);
+    gl.uniform1f(gl.getUniformLocation(progBright, 'uThreshold'), threshold);
+    drawQuad(progBright);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboBlur.fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.useProgram(progBlur);
+    bindTexture(fboBright.tex, 0);
+    gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
+    gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), radius / bw, 0);
+    drawQuad(progBlur);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboBright.fbo);
+    gl.viewport(0, 0, bw, bh);
+    bindTexture(fboBlur.tex, 0);
+    gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
+    gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), 0, radius / bh);
+    drawQuad(progBlur);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, width, height);
+    gl.useProgram(progCompositeSingle);
+    bindTexture(fboScene.tex, 0);
+    bindTexture(fboBright.tex, 1);
+    gl.uniform1i(gl.getUniformLocation(progCompositeSingle, 'uScene'), 0);
+    gl.uniform1i(gl.getUniformLocation(progCompositeSingle, 'uBloom'), 1);
+    gl.uniform1f(gl.getUniformLocation(progCompositeSingle, 'uIntensity'), intensity);
+    drawQuad(progCompositeSingle);
+  }
+
+  function setParams(p) {
+    if (p.threshold !== undefined) threshold = p.threshold;
+    if (p.intensity !== undefined) intensity = p.intensity;
+    if (p.radius !== undefined) radius = p.radius;
+  }
+
+  return {
+    init, resize, beginScene, endScene, setParams,
+    get levels(){ return MULTI_LEVEL ? LEVELS : 1; },
+    get ssaa()  { return FBO_SS; }
+  };
+
+})();
+
+/*  
+  旧版Bloom，不适用也不可用
+  const OldBloom = (function () {
+
+  let gl = null;
+  let width = 1, height = 1;
+
+  // ★★★ 开关：true = 多级，false = 单级 ★★★
+  const MULTI_LEVEL = MULTI_BLOOM;
+
+  // 多级用
+  const LEVELS = 4;
+  let bloomFBOs = [];
+  let blurFBOs = [];
+
+  // 单级用
+  let fboBright = null, fboBlur = null;
+
+  // 场景 FBO（SSAA 后的普通纹理，也是 MSAA resolve 目标）
+  let fboScene = null;
+  // 场景 MSAA FBO（多重采样渲染目标）
+  let fboSceneMS = null;
+
+  let progBright = null, progBlur = null;
+  let progCompositeMulti = null;
+  let progCompositeSingle = null;
+  let quadBuf = null;
+
+  let threshold = 0.45;
+  let intensity = 1.6;
+  let radius = 2.5;
+  let sceneHasAlpha = true;
+
+  let msaaEnabled = false;
+  let msaaSamples = 1;
+
+  // ---------- Shader ---------- *
+
+  const VS_QUAD = `#version 300 es
+    in vec2 aPos;
+    out vec2 vUV;
+    void main(){
+      vUV = aPos * 0.5 + 0.5;
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }`;
+
+  const FS_BRIGHT = `#version 300 es
+    precision mediump float;
+    in vec2 vUV;
+    uniform sampler2D uScene;
+    uniform float uThreshold;
+    out vec4 fragColor;
+    void main(){
+      vec4 s = texture(uScene, vUV);
+      vec3 c = s.rgb;
+      float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      float d = max(lum, 0.0001);
+      float f = max(lum - uThreshold, 0.0) / d;
+      fragColor = vec4(c * f, 1.0);
+    }`;
+
+  const FS_BLUR = `#version 300 es
+    precision mediump float;
+    in vec2 vUV;
+    uniform sampler2D uTexture;
+    uniform vec2 uDirection;
+    out vec4 fragColor;
+    void main(){
+      float w0 = 0.227027, w1 = 0.1945946, w2 = 0.1216216, w3 = 0.054054, w4 = 0.016216;
+      vec3 result = texture(uTexture, vUV).rgb * w0;
+      vec2 o1 = uDirection * 1.0;
+      vec2 o2 = uDirection * 2.0;
+      vec2 o3 = uDirection * 3.0;
+      vec2 o4 = uDirection * 4.0;
+      result += texture(uTexture, vUV + o1).rgb * w1;
+      result += texture(uTexture, vUV - o1).rgb * w1;
+      result += texture(uTexture, vUV + o2).rgb * w2;
+      result += texture(uTexture, vUV - o2).rgb * w2;
+      result += texture(uTexture, vUV + o3).rgb * w3;
+      result += texture(uTexture, vUV - o3).rgb * w3;
+      result += texture(uTexture, vUV + o4).rgb * w4;
+      result += texture(uTexture, vUV - o4).rgb * w4;
+      fragColor = vec4(result, 1.0);
+    }`;
+
+  // 多级合成
+  const FS_COMPOSITE_MULTI = `#version 300 es
+    precision mediump float;
+    in vec2 vUV;
+    uniform sampler2D uScene;
+    uniform sampler2D uBloom0;
+    uniform sampler2D uBloom1;
+    uniform sampler2D uBloom2;
+    uniform sampler2D uBloom3;
+    uniform float uIntensity;
+    out vec4 fragColor;
+    void main(){
+      vec4 scene = texture(uScene, vUV);
+      // 权重和 > 1，叠加而非平均
+      vec3 b = texture(uBloom0, vUV).rgb * 0.9
+             + texture(uBloom1, vUV).rgb * 0.5
+             + texture(uBloom2, vUV).rgb * 0.3
+             + texture(uBloom3, vUV).rgb * 0.15;
+      b *= scene.a;
+      vec3 color = scene.rgb + b * uIntensity;
+      // 轻量 tone mapping
+      float maxC = max(max(color.r, color.g), color.b);
+      color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
+      fragColor = vec4(color, scene.a);
+    }`;
+
+  // 单级合成
+  const FS_COMPOSITE_SINGLE = `#version 300 es
+    precision mediump float;
+    in vec2 vUV;
+    uniform sampler2D uScene;
+    uniform sampler2D uBloom;
+    uniform float uIntensity;
+    out vec4 fragColor;
+    void main(){
+      vec4 scene = texture(uScene, vUV);
+      vec3 bloom = texture(uBloom, vUV).rgb;
+      bloom *= scene.a;
+      vec3 color = scene.rgb + bloom * uIntensity;
+      float maxC = max(max(color.r, color.g), color.b);
+      color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
+      fragColor = vec4(color, scene.a);
+    }`;
+
+  // ---------- 工具函数 ---------- 
+
+  function compile2(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error('Bloom shader error: ' + gl.getShaderInfoLog(s));
+    return s;
+  }
+
+  function link(vsSrc, fsSrc) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile2(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, compile2(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+      throw new Error('Bloom link error: ' + gl.getProgramInfoLog(p));
+    return p;
+  }
+
+  // ---------- 普通纹理 FBO ----------
 
   function createFBO(w, h) {
     const tex = gl.createTexture();
@@ -279,7 +642,7 @@ const Bloom = (function () {
     gl.deleteTexture(f.tex);
   }
 
-  /* ---------- 多重采样 FBO（MSAA） ---------- */
+  // ---------- 多重采样 FBO（MSAA） ----------
 
   function createMSFBO(w, h, samples) {
     const fbo = gl.createFramebuffer();
@@ -319,7 +682,7 @@ const Bloom = (function () {
     gl.disableVertexAttribArray(loc);
   }
 
-  /* ---------- 多级模糊辅助 ---------- */
+  // ---------- 多级模糊辅助 ----------
 
   function blurLevel(i, r) {
     const src = bloomFBOs[i];
@@ -341,16 +704,16 @@ const Bloom = (function () {
     drawQuad(progBlur);
   }
 
-  /* ---------- 公开 API ---------- */
+  // ---------- 公开 API ---------- 
 
   function init(glCtx, w, h, opts) {
     gl = glCtx;
     if (opts && opts.sceneHasAlpha !== undefined) sceneHasAlpha = opts.sceneHasAlpha;
 
     progBright = link(VS_QUAD, FS_BRIGHT);
-    progBlur   = link(VS_QUAD, FS_BLUR);
-    progCompositeMulti  = MULTI_LEVEL ? link(VS_QUAD, FS_COMPOSITE_MULTI)  : null;
-    progCompositeSingle = MULTI_LEVEL ? null : link(VS_QUAD, FS_COMPOSITE_SINGLE);
+    progBlur = link(VS_QUAD, FS_BLUR);
+    progCompositeMulti = link(VS_QUAD, FS_COMPOSITE_MULTI);
+    progCompositeSingle = link(VS_QUAD, FS_COMPOSITE_SINGLE);
 
     quadBuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
@@ -358,16 +721,6 @@ const Bloom = (function () {
       -1, -1,  1, -1, -1,  1,
       -1,  1,  1, -1,  1,  1,
     ]), gl.STATIC_DRAW);
-
-    // 1x1 黑色占位纹理（用于补齐未使用的 sampler）
-    nullTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, nullTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
-                  new Uint8Array([0, 0, 0, 255]));
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
     resize(w, h);
   }
@@ -383,20 +736,11 @@ const Bloom = (function () {
     bloomFBOs.forEach(destroyFBO);
     blurFBOs.forEach(destroyFBO);
     bloomFBOs = [];
-    blurFBOs  = [];
-    
-    // Bloom 关闭：不建任何场景/Bloom FBO，直接画默认 framebuffer
-    if (LEVELS === 0) {
-      msaaSamples = 1;
-      msaaEnabled = false;
-      fboScene = null;
-      fboSceneMS = null;
-      return;
-    }
+    blurFBOs = [];
 
     // 场景 SSAA 尺寸
     const SS = FBO_SS;
-    const sw = Math.max(1, Math.round(width  * SS));
+    const sw = Math.max(1, Math.round(width * SS));
     const sh = Math.max(1, Math.round(height * SS));
 
     // SSAA 目标纹理（resolve 后作为 Bloom 输入）
@@ -412,28 +756,20 @@ const Bloom = (function () {
     if (MULTI_LEVEL) {
       for (let i = 0; i < LEVELS; i++) {
         const div = Math.pow(2, i + 1);
-        const bw = Math.max(1, Math.floor(width  / div));
+        const bw = Math.max(1, Math.floor(width / div));
         const bh = Math.max(1, Math.floor(height / div));
         bloomFBOs.push(createFBO(bw, bh));
         blurFBOs.push(createFBO(bw, bh));
       }
     } else {
-      const bw = Math.max(1, Math.floor(width  / 2));
+      const bw = Math.max(1, Math.floor(width / 2));
       const bh = Math.max(1, Math.floor(height / 2));
       fboBright = createFBO(bw, bh);
-      fboBlur   = createFBO(bw, bh);
+      fboBlur = createFBO(bw, bh);
     }
   }
 
   function beginScene() {
-    if (LEVELS === 0) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.viewport(0, 0, width, height);
-      if (sceneHasAlpha) gl.clearColor(0, 0, 0, 0);
-      else gl.clearColor(0.071, 0.086, 0.078, 1);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      return;
-    }
     const target = msaaEnabled ? fboSceneMS : fboScene;
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
     gl.viewport(0, 0, target.w, target.h);
@@ -446,25 +782,27 @@ const Bloom = (function () {
   }
 
   function endScene() {
-    if (LEVELS === 0) return;
     // MSAA resolve → fboScene
     if (msaaEnabled) {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboSceneMS.fbo);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, fboScene.fbo);
       gl.blitFramebuffer(
         0, 0, fboSceneMS.w, fboSceneMS.h,
-        0, 0, fboScene.w,   fboScene.h,
+        0, 0, fboScene.w, fboScene.h,
         gl.COLOR_BUFFER_BIT, gl.NEAREST
       );
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
     }
 
-    if (MULTI_LEVEL) endSceneMulti();
-    else             endSceneSingle();
+    if (MULTI_LEVEL) {
+      endSceneMulti();
+    } else {
+      endSceneSingle();
+    }
   }
 
-  /* ---- 多级 ---- */
+  // ---- 多级 ---- 
   function endSceneMulti() {
     // Pass 1: 亮度提取 → bloom0
     const b0 = bloomFBOs[0];
@@ -479,7 +817,7 @@ const Bloom = (function () {
     // Pass 2: 逐级
     for (let i = 0; i < LEVELS; i++) {
       if (i > 0) {
-        const cur  = bloomFBOs[i];
+        const cur = bloomFBOs[i];
         const prev = bloomFBOs[i - 1];
         gl.bindFramebuffer(gl.FRAMEBUFFER, cur.fbo);
         gl.viewport(0, 0, cur.w, cur.h);
@@ -492,27 +830,25 @@ const Bloom = (function () {
       blurLevel(i, radius);
     }
 
-    // Pass 3: 合成（固定 4 个 sampler，缺失绑 nullTex）
+    // Pass 3: 合成
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, width, height);
     gl.useProgram(progCompositeMulti);
-
     bindTexture(fboScene.tex, 0);
+    bindTexture(bloomFBOs[0].tex, 1);
+    bindTexture(bloomFBOs[1].tex, 2);
+    bindTexture(bloomFBOs[2].tex, 3);
+    bindTexture(bloomFBOs[3].tex, 4);
     gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uScene'), 0);
-
-    for (let i = 0; i < 4; i++) {
-      const unit = i + 1;
-      const tex  = i < LEVELS ? bloomFBOs[i].tex : nullTex;
-      bindTexture(tex, unit);
-      gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom' + i), unit);
-    }
-
-    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uLevels'), LEVELS);
+    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom0'), 1);
+    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom1'), 2);
+    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom2'), 3);
+    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom3'), 4);
     gl.uniform1f(gl.getUniformLocation(progCompositeMulti, 'uIntensity'), intensity);
     drawQuad(progCompositeMulti);
   }
 
-  /* ---- 单级 ---- */
+  // ---- 单级 ---- 
   function endSceneSingle() {
     const bw = fboBright.w, bh = fboBright.h;
 
@@ -560,15 +896,17 @@ const Bloom = (function () {
     if (p.radius !== undefined) radius = p.radius;
   }
 
-  return {
+  return { 
     init, resize, beginScene, endScene, setParams,
-    get mode()  { return MULTI_LEVEL ? 'Multi' : 'Single'; },
+    //get mode()  { return MULTI_LEVEL ? 'Multi' : 'Single'; },
     get levels(){ return MULTI_LEVEL ? LEVELS : 1; },
     get ssaa()  { return FBO_SS; },
-    get msaa()  { return msaaSamples; }
+    get msaa()  { return msaaSamples; } 
   };
-
+  
 })();
+*/
+
 
 /* ============================================================
  *  顶点缓冲
@@ -744,7 +1082,7 @@ function frame(t) {
   }
 
   // ---- Bloom 动态参数（和音频能量联动） ----
-  const bloomIntensity = 1.2 + energy * 0.25;
+  const bloomIntensity = 1.0 + energy * 0.25;
   const bloomThreshold = 0.4 - energy * 0.15;
   Bloom.setParams({
     intensity: bloomIntensity,
@@ -985,6 +1323,7 @@ function update() {
     : '待机 · ' + (mode === 'demo' ? '演示预览' : '已暂停');
   $('tracksub').textContent = playing ? '控制棒随频谱实时响应' : '点击播放，启动声场';
   $('seek').disabled = mode !== 'file';
+  window.__dbg = { gl, Bloom, prog, vbo, A, get vertexCount(){ return vertexCount; }, ext: gl.getExtension('EXT_disjoint_timer_query_webgl2') };
 }
 
 async function start() {
@@ -1219,7 +1558,7 @@ size();
 requestAnimationFrame(frame);
 
 $('ssaa').textContent = Bloom.ssaa + 'x';
-$('msaa').textContent = Bloom.msaa + 'x';
+//$('msaa').textContent = Bloom.msaa + 'x';
 //$('bloomMode').textContent   = Bloom.mode;
 $('bloomLevels').textContent = Bloom.levels + 'x';
 //$('fftSize').textContent = FFTSize
@@ -1259,4 +1598,9 @@ if (document.modelContext?.registerTool) {
     })).catch(() => {});
   } catch (e) {}
 }
+*/
+
+
+/* 控制台里的GPU帧时间
+(() => {const { gl, Bloom, prog, vbo, A, ext } = window.__dbg;if (!ext) { console.warn('EXT_disjoint_timer_query_webgl2 不可用'); return; }const vertexCount = window.__dbg.vertexCount;if (!vertexCount) { console.warn('vertexCount 为 0，可能还没渲染过'); return; }const query = gl.createQuery();gl.beginQuery(ext.TIME_ELAPSED_EXT, query);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.disable(gl.DEPTH_TEST);Bloom.beginScene();gl.useProgram(prog);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.enableVertexAttribArray(A.pos);gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);gl.enableVertexAttribArray(A.color);gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);gl.drawArrays(gl.TRIANGLES, 0, vertexCount);Bloom.endScene();gl.endQuery(ext.TIME_ELAPSED_EXT);function poll() {const available = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);if (disjoint) { console.warn('GPU disjoint，丢弃'); gl.deleteQuery(query); return; }if (available) {const ms = gl.getQueryParameter(query, gl.QUERY_RESULT) / 1e6;console.log('GPU 帧时间 (ms):', ms.toFixed(3));gl.deleteQuery(query);} else {requestAnimationFrame(poll);}}requestAnimationFrame(poll);})();
 */
