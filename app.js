@@ -21,7 +21,7 @@ let smoothPeakIndex = 0;
 let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
 const FFTSize = 2048;
-const FBO_Bloom = 1;    //Bloom泛光 1-4
+const FBO_Bloom = 2;    //Bloom泛光 1-4
 const FBO_SS = 2;   //SSAA 1-inf
 //const FBO_MS = 4;   //MSAA 1-inf 没用
 let LOOP = true;  //循环播放
