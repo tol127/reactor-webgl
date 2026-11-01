@@ -1,2 +1,4 @@
 # reactor-audio-visualizer-webgl
-以切尔诺贝利反应堆堆芯的控制棒阵列为视觉原型的实时音频可视化实验(WebGL重写)。
+以切尔诺贝利反应堆堆芯的控制棒阵列为视觉原型的实时音频可视化实验
+让Deepseek网页版使用WebGL重写，并且加上了Bloom泛光效果
+AI太好用了
