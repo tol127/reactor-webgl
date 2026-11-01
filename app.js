@@ -20,6 +20,8 @@ let gain = 1.4, smoothing = 0.75, energy = 0;
 let smoothPeakIndex = 0;
 let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
+let playStartCtxTime = 0;   // 新增：本次播放的 ctx 起点
+let playStartOffset = 0;    // 新增：本次播放的 buffer 起点
 const FFTSize = 2048;
 const FBO_Bloom = 1;    //Bloom泛光 1-4
 const FBO_SS = 2;   //SSAA 1.0-2.0
@@ -653,8 +655,8 @@ function frame(t) {
   }
 
   // ---- Bloom 动态参数（和音频能量联动） ----
-  const bloomIntensity = 1.35 + energy * 0.75;
-  const bloomThreshold = 0.40 - energy * 0.25;
+  const bloomIntensity = Math.min(3.00,1.35 + energy * 0.75);
+  const bloomThreshold = Math.max(0.15,0.40 - energy * 0.25);
   Bloom.setParams({
     intensity: bloomIntensity,
     threshold: bloomThreshold,
@@ -842,15 +844,17 @@ function frame(t) {
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
     $('freq').innerHTML = (playing && peak > 0 ? Math.round(smoothPeakIndex * binHz) : '—') + '<small>Hz</small>';
     if (playing && !seeking) {
-      let seconds = offset + ctx.currentTime - started;
-              if (buffer && mode === 'file') {
-            seconds = seconds % buffer.duration;   // ← 进度循环
+      let seconds;
+      if (buffer && mode === 'file') {
+        const elapsed = ctx.currentTime - playStartCtxTime;
+        seconds = (playStartOffset + elapsed) % buffer.duration;
         $('seek').value = seconds / buffer.duration * 100;
+      } else {
+            seconds = offset + (ctx.currentTime - started);
       }
       $('elapsed').textContent = format(seconds);
-    }
+    }    
   }
-
   requestAnimationFrame(frame);
 }
 
@@ -935,20 +939,24 @@ async function start() {
     } else {
       master.gain.value = +$('volume').value / 100;
 
-      if (mode === 'file' && buffer) {
+    if (mode === 'file' && buffer) {
       source = ctx.createBufferSource();
       source.buffer = buffer;
-      source.loop = LOOP;                    // ← 循环开关
+      source.loop = LOOP;
       source.connect(analyser);
       source.onended = () => {
-        if (LOOP) return;                    // 循环时不走停止逻辑
+        if (LOOP) return;
         stop();
         offset = 0;
         $('seek').value = 0;
         $('elapsed').textContent = '00:00';
       };
+      // ★ 用 offset（可能已 %= duration）作为起点
       source.start(0, offset);
-      } else {
+          // ★ 记录本次播放的 ctx 时刻
+      playStartCtxTime = ctx.currentTime;
+      playStartOffset = offset;
+    } else {
         [55, 82.41, 110, 164.81, 220, 329.63, 440, 659.25].forEach((freq, i) => {
           const osc = ctx.createOscillator();
           const v = ctx.createGain();
@@ -989,8 +997,13 @@ async function start() {
  * ============================================================ */
 $('play').onclick = () => {
   if (playing) {
-    offset += ctx.currentTime - started;
-    stop();
+    if (buffer && mode === 'file') {
+      const elapsed = ctx.currentTime - playStartCtxTime;
+      offset = (playStartOffset + elapsed) % buffer.duration;  // ← 取模，且用真实位置
+    } else {
+      offset += ctx.currentTime - started;
+    }
+    stop(); 
   } else start();
 };
 
@@ -1049,6 +1062,48 @@ $('file').onchange = async e => {
     //e.target.value = '';
   }
 };
+
+document.addEventListener('keydown', e => {
+  // ★ 按住重复触发直接忽略
+  if (e.repeat) return;
+
+  const el = document.activeElement;
+  const tag = el?.tagName;
+  const isTextInput =
+    el && el !== document.body && el !== document.documentElement &&
+    (
+      tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+      el.isContentEditable
+    );
+
+  if (isTextInput) return;
+
+  // ---- 空格：播放/暂停 ----
+  if (e.code === 'Space') {
+    e.preventDefault();
+    // ★ 额外保险：阻止事件继续传播，避免其他监听重复处理
+    e.stopPropagation();
+    $('play').click();
+    return;
+  }
+
+  // ---- 左右键：进度跳转 ----
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (mode !== 'file' || !buffer) return;
+
+  e.preventDefault();
+
+  const STEP = 5;
+  const dir = e.key === 'ArrowRight' ? 1 : -1;
+  const cur = +$('seek').value / 100 * buffer.duration;
+  const next = Math.max(0, Math.min(buffer.duration, cur + dir * STEP));
+
+  $('seek').value = next / buffer.duration * 100;
+  $('seek').dispatchEvent(new Event('input'));
+  $('seek').dispatchEvent(new Event('change'));
+});
+
+
 
 $('seek').onkeydown = e => {
   if (mode !== 'file' || !buffer) return;
