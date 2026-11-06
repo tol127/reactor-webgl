@@ -17,7 +17,7 @@ let session = 0, rafTime = 0;
 let angle = -0.32, tilt = 0.58, zoom = 1, drag = null;
 let demoNodes = [];
 let gain = 1.4, smoothing = 0.75, energy = 0;
-let smoothPeakIndex = 0;
+let smoothPeakIndex = 0,  smoothfundPeakIndex = 0, smooth = 0.8;
 let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
 let playStartCtxTime = 0;   // 新增：本次播放的 ctx 起点
@@ -641,12 +641,26 @@ function frame(t) {
   // ---- 音频分析 ----
   if (analyser && playing) analyser.getByteFrequencyData(bins);
   let peak = 0, peakIndex = 0;
+  let fundPeak = 0, fundIndex = 0;
+  
   if (playing && bins) {
+    // 基础频率
     for (let i = 2; i < bins.length - 2; i++) {
+      if (bins[i] > fundPeak) { fundPeak = bins[i]; fundIndex = i; }
+    }
+    smoothPeakIndex = smoothPeakIndex * smooth + fundIndex * (1.0 - smooth);
+
+    // 峰值频率（300Hz 以上找最大值）
+    const sampleRate = ctx ? ctx.sampleRate : 44100;
+    const binHz = sampleRate / FFTSize;
+    const startHigh = Math.floor(300 / binHz);
+    for (let i = startHigh; i < bins.length - 2; i++) {
       if (bins[i] > peak) { peak = bins[i]; peakIndex = i; }
     }
-    smoothPeakIndex = smoothPeakIndex * 0.7 + peakIndex * 0.3;
+    smoothfundPeakIndex = smoothfundPeakIndex * smooth + peakIndex * (1.0 - smooth);
+    
   }
+  
   energy = 0;
   if (playing && wave) {
     analyser.getFloatTimeDomainData(wave);
@@ -842,7 +856,9 @@ function frame(t) {
   // ---- 读数 ----
   if (t % 100 < 25) {
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
-    $('freq').innerHTML = (playing && peak > 0 ? Math.round(smoothPeakIndex * binHz) : '—') + '<small>Hz</small>';
+    $('fund').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    $('freq').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    
     if (playing && !seeking) {
       let seconds;
       if (buffer && mode === 'file') {
