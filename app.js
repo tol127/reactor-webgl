@@ -1168,15 +1168,65 @@ $('volume').oninput = e => {
 
 /* 拖拽旋转 */
 canvas.addEventListener('pointerdown', e => {
+  const rect = canvas.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height * 0.55;
+
+  drag = { x: e.clientX, y: e.clientY, cx, cy };
+  canvas.setPointerCapture(e.pointerId);
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+
+  // 用当前指针位置相对中心的偏移求极角
+  const dx = e.clientX - drag.cx;
+  const dy = e.clientY - drag.cy;
+  const r = Math.hypot(dx, dy) || 1;
+
+  // 指针在圆盘"前侧"时 dy>0，后侧 dy<0；
+  // 用 dy/r 作为连续权重，范围 [-1, 1]：
+  //   前侧(dy>0) → 权重为负（angle -=）
+  //   后侧(dy<0) → 权重为正（angle +=）
+  //   左右两侧(dy≈0) → 权重≈0，旋转平滑经过 0，不会突跳
+  const frontWeight = -dy / r;   // 前侧为负，后侧为正
+
+  const dxMove = e.clientX - drag.x;
+  angle += frontWeight * dxMove * 0.006;
+
+  // 指针太靠近中心时 frontWeight 抖动大，做个下限保护
+  // （可选：只在离中心足够远时才应用）
+
+  tilt = Math.max(0.3, Math.min(0.8, tilt + (e.clientY - drag.y) * 0.005));
+
+  drag.x = e.clientX;
+  drag.y = e.clientY;
+});
+
+/*
+canvas.addEventListener('pointerdown', e => {
   drag = { x: e.clientX, y: e.clientY };
   canvas.setPointerCapture(e.pointerId);
 });
 canvas.addEventListener('pointermove', e => {
   if (!drag) return;
-  angle -= (e.clientX - drag.x) * 0.006;
+
+  const rect = canvas.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height * 0.55;   // 与 project() 的 0.55 对齐
+
+  // 指针在画布中心"上方"→ 后半（far）；"下方"→ 前半（near）
+  const isFront = e.clientY >= cy;
+
+  const dx = e.clientX - drag.x;
+  // 前半区：向右拖 → 角度减小；后半区：向右拖 → 角度增大（方向相反）
+  angle += (isFront ? -1 : 1) * dx * 0.006;
+
   tilt = Math.max(0.3, Math.min(0.8, tilt + (e.clientY - drag.y) * 0.005));
   drag = { x: e.clientX, y: e.clientY };
 });
+*/
+
 canvas.addEventListener('pointerup', () => drag = null);
 canvas.addEventListener('pointercancel', () => drag = null);
 
