@@ -27,11 +27,18 @@ let vertOverflowWarned = false; // 顶点越界
 let staticDirty = true;
 let sortedRods = null;   // 缓存的深度排序结果
 const MAX_STATIC_VERTS = 8192; // 极限2784
-const MAX_DYN_VERTS    = 262144;   // 极限102096
+const MAX_DYN_VERTS    = 262144;   // 极限约102096
 const FFTSize = 2048;
 const FBO_Bloom = 1;
 const FBO_SS = 2;
+const EAT_BLOOM = false;
 
+/*
+更新内容：
+1.EAT_BLOOM
+2.EAT_BLOOM
+3.EAT_BLOOM
+*/
 
 /* ============================================================
  *  控制棒数据
@@ -215,7 +222,7 @@ const Bloom = (function () {
     void main(){
       vec4 scene = texture(uScene, vUV);
       vec3 bloom = texture(uBloom, vUV).rgb;
-      bloom *= scene.a;
+      ${EAT_BLOOM ? 'bloom *= scene.a;' : ''}
       vec3 color = scene.rgb + bloom * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
       color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
@@ -724,8 +731,6 @@ function buildDynamicGeometry() {
   setWriteTarget(dynData, dynData.length);
   updateCameraCache();
 
-  // 深度排序（修复：按 angle 排序，只在相机变化时才需要重排；
-  // 此处保留每帧排序以便未来支持棒高度影响顺序时扩展，但用缓存 sin/cos）
   const sinA = camSin.v, cosA = camCos.v;
   const sorted = sortedRods;
 
