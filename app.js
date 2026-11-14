@@ -17,15 +17,21 @@ let session = 0, rafTime = 0;
 let angle = -0.32, tilt = 0.58, zoom = 1, drag = null;
 let demoNodes = [];
 let gain = 1.4, smoothing = 0.75, energy = 0;
-let smoothPeakIndex = 0,  smoothfundPeakIndex = 0, smooth = 0.8;
+let smoothPeakIndex = 0, smoothfundPeakIndex = 0, smooth = 0.8;
 let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
-let playStartCtxTime = 0;   // 新增：本次播放的 ctx 起点
-let playStartOffset = 0;    // 新增：本次播放的 buffer 起点
+let playStartCtxTime = 0;
+let playStartOffset = 0;
+let LOOP = true;
+let vertOverflowWarned = false; // 顶点越界
+let staticDirty = true;
+let sortedRods = null;   // 缓存的深度排序结果
+const MAX_STATIC_VERTS = 8192; // 极限2784
+const MAX_DYN_VERTS    = 262144;   // 极限102096
 const FFTSize = 2048;
-const FBO_Bloom = 1;    //Bloom泛光 1-4
-const FBO_SS = 2;   //SSAA 1.0-2.0
-let LOOP = true;  //循环播放
+const FBO_Bloom = 1;
+const FBO_SS = 2;
+
 
 /* ============================================================
  *  控制棒数据
@@ -98,14 +104,12 @@ const A = {
 
 /* ============================================================
  *  Bloom 后处理模块（仅 SSAA）
- *  FBO_Bloom: 1=单级, 2~4=多级（层数=数值）
  * ============================================================ */
 const Bloom = (function () {
 
   let gl = null;
   let width = 1, height = 1;
 
-  // ★★★ 开关：1 = 单级，2~4 = 多级层数 ★★★
   const MULTI_LEVEL = FBO_Bloom > 1;
   const LEVELS = MULTI_LEVEL ? Math.min(Math.max(FBO_Bloom, 2), 4) : 0;
 
@@ -118,6 +122,9 @@ const Bloom = (function () {
   let progCompositeMulti = null;
   let progCompositeSingle = null;
   let quadBuf = null;
+
+  // ---- uniform location 缓存（修复项 6）----
+  let U = null;
 
   let threshold = 0.25;
   let intensity = 1.8;
@@ -174,7 +181,6 @@ const Bloom = (function () {
       fragColor = vec4(result, 1.0);
     }`;
 
-  // 多级合成（固定 4 个 sampler，用权重 uniform 控制实际层数）
   const FS_COMPOSITE_MULTI = `#version 300 es
     precision mediump float;
     in vec2 vUV;
@@ -213,6 +219,9 @@ const Bloom = (function () {
       vec3 color = scene.rgb + bloom * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
       color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
+      vec2 uv = vUV - 0.5;
+      float vig = 1.0 - dot(uv, uv) * 1.6;
+      color *= vig;
       fragColor = vec4(color, scene.a);
     }`;
 
@@ -284,15 +293,15 @@ const Bloom = (function () {
     gl.viewport(0, 0, tmp.w, tmp.h);
     gl.useProgram(progBlur);
     bindTexture(src.tex, 0);
-    gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
-    gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), r / tmp.w, 0);
+    gl.uniform1i(U.blur.uTexture, 0);
+    gl.uniform2f(U.blur.uDirection, r / tmp.w, 0);
     drawQuad(progBlur);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, src.fbo);
     gl.viewport(0, 0, src.w, src.h);
     bindTexture(tmp.tex, 0);
-    gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
-    gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), 0, r / src.h);
+    gl.uniform1i(U.blur.uTexture, 0);
+    gl.uniform2f(U.blur.uDirection, 0, r / src.h);
     drawQuad(progBlur);
   }
 
@@ -306,6 +315,29 @@ const Bloom = (function () {
     progBlur = link(VS_QUAD, FS_BLUR);
     progCompositeMulti = link(VS_QUAD, FS_COMPOSITE_MULTI);
     progCompositeSingle = link(VS_QUAD, FS_COMPOSITE_SINGLE);
+
+    // ---- 一次性缓存所有 uniform location（修复项 6）----
+    U = {
+      bright: {
+        uScene: gl.getUniformLocation(progBright, 'uScene'),
+        uThreshold: gl.getUniformLocation(progBright, 'uThreshold')
+      },
+      blur: {
+        uTexture: gl.getUniformLocation(progBlur, 'uTexture'),
+        uDirection: gl.getUniformLocation(progBlur, 'uDirection')
+      },
+      compMulti: {
+        uScene: gl.getUniformLocation(progCompositeMulti, 'uScene'),
+        uIntensity: gl.getUniformLocation(progCompositeMulti, 'uIntensity'),
+        uBloom: [0, 1, 2, 3].map(i => gl.getUniformLocation(progCompositeMulti, 'uBloom' + i)),
+        uW:     [0, 1, 2, 3].map(i => gl.getUniformLocation(progCompositeMulti, 'uW' + i))
+      },
+      compSingle: {
+        uScene: gl.getUniformLocation(progCompositeSingle, 'uScene'),
+        uBloom: gl.getUniformLocation(progCompositeSingle, 'uBloom'),
+        uIntensity: gl.getUniformLocation(progCompositeSingle, 'uIntensity')
+      }
+    };
 
     quadBuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
@@ -366,17 +398,15 @@ const Bloom = (function () {
   }
 
   function endSceneMulti() {
-    // Pass 1: 亮度提取 → bloom0
     const b0 = bloomFBOs[0];
     gl.bindFramebuffer(gl.FRAMEBUFFER, b0.fbo);
     gl.viewport(0, 0, b0.w, b0.h);
     gl.useProgram(progBright);
     bindTexture(fboScene.tex, 0);
-    gl.uniform1i(gl.getUniformLocation(progBright, 'uScene'), 0);
-    gl.uniform1f(gl.getUniformLocation(progBright, 'uThreshold'), threshold);
+    gl.uniform1i(U.bright.uScene, 0);
+    gl.uniform1f(U.bright.uThreshold, threshold);
     drawQuad(progBright);
 
-    // Pass 2: 逐级
     for (let i = 0; i < LEVELS; i++) {
       if (i > 0) {
         const cur = bloomFBOs[i];
@@ -385,76 +415,68 @@ const Bloom = (function () {
         gl.viewport(0, 0, cur.w, cur.h);
         gl.useProgram(progBlur);
         bindTexture(prev.tex, 0);
-        gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
-        gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), 0, 0);
+        gl.uniform1i(U.blur.uTexture, 0);
+        gl.uniform2f(U.blur.uDirection, 0, 0);
         drawQuad(progBlur);
       }
       blurLevel(i, radius);
     }
 
-    // Pass 3: 合成（按 LEVELS 设置权重，多余层权重 0）
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, width, height);
     gl.useProgram(progCompositeMulti);
 
     bindTexture(fboScene.tex, 0);
-    gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uScene'), 0);
+    gl.uniform1i(U.compMulti.uScene, 0);
 
     const weights = [0.9, 0.5, 0.3, 0.15];
     for (let i = 0; i < 4; i++) {
-      // 层数不足时绑到 bloom0，并把权重设为 0
       const tex = i < LEVELS ? bloomFBOs[i].tex : bloomFBOs[0].tex;
       bindTexture(tex, i + 1);
-      gl.uniform1i(gl.getUniformLocation(progCompositeMulti, 'uBloom' + i), i + 1);
-      gl.uniform1f(gl.getUniformLocation(progCompositeMulti, 'uW' + i),
-                   i < LEVELS ? weights[i] : 0);
+      gl.uniform1i(U.compMulti.uBloom[i], i + 1);
+      gl.uniform1f(U.compMulti.uW[i], i < LEVELS ? weights[i] : 0);
     }
-    gl.uniform1f(gl.getUniformLocation(progCompositeMulti, 'uIntensity'), intensity);
+    gl.uniform1f(U.compMulti.uIntensity, intensity);
     drawQuad(progCompositeMulti);
   }
 
   function endSceneSingle() {
     const bw = fboBright.w, bh = fboBright.h;
-    
-    // ---- Pass 1: 亮度提取 ----
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, fboBright.fbo);
     gl.viewport(0, 0, bw, bh);
     gl.useProgram(progBright);
     bindTexture(fboScene.tex, 0);
-    gl.uniform1i(gl.getUniformLocation(progBright, 'uScene'), 0);
-    gl.uniform1f(gl.getUniformLocation(progBright, 'uThreshold'), threshold);
+    gl.uniform1i(U.bright.uScene, 0);
+    gl.uniform1f(U.bright.uThreshold, threshold);
     drawQuad(progBright);
 
-    // ---- N 遍 H+V ----
     const BLUR_PASSES = 4;
     gl.useProgram(progBlur);
     for (let p = 0; p < BLUR_PASSES; p++) {
-      // 水平：fboBright → fboBlur
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboBlur.fbo);
       gl.viewport(0, 0, bw, bh);
       bindTexture(fboBright.tex, 0);
-      gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
-      gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), singleRadius / bw, 0);
+      gl.uniform1i(U.blur.uTexture, 0);
+      gl.uniform2f(U.blur.uDirection, singleRadius / bw, 0);
       drawQuad(progBlur);
 
-      // 垂直：fboBlur → fboBright
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboBright.fbo);
       gl.viewport(0, 0, bw, bh);
       bindTexture(fboBlur.tex, 0);
-      gl.uniform1i(gl.getUniformLocation(progBlur, 'uTexture'), 0);
-      gl.uniform2f(gl.getUniformLocation(progBlur, 'uDirection'), 0, singleRadius / bh);
+      gl.uniform1i(U.blur.uTexture, 0);
+      gl.uniform2f(U.blur.uDirection, 0, singleRadius / bh);
       drawQuad(progBlur);
     }
 
-    // ---- 合成（原逻辑不变）----
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, width, height);
     gl.useProgram(progCompositeSingle);
     bindTexture(fboScene.tex, 0);
     bindTexture(fboBright.tex, 1);
-    gl.uniform1i(gl.getUniformLocation(progCompositeSingle, 'uScene'), 0);
-    gl.uniform1i(gl.getUniformLocation(progCompositeSingle, 'uBloom'), 1);
-    gl.uniform1f(gl.getUniformLocation(progCompositeSingle, 'uIntensity'), intensity);
+    gl.uniform1i(U.compSingle.uScene, 0);
+    gl.uniform1i(U.compSingle.uBloom, 1);
+    gl.uniform1f(U.compSingle.uIntensity, intensity);
     drawQuad(progCompositeSingle);
   }
 
@@ -473,29 +495,46 @@ const Bloom = (function () {
 })();
 
 /* ============================================================
- *  顶点缓冲
+ *  顶点缓冲（修复项 3：静态 / 动态分离 + 越界保护）
  * ============================================================ */
-const MAX_VERTS = 160000;
-const vertexData = new Float32Array(MAX_VERTS * 6);
-let vertexCount = 0;
+const staticData = new Float32Array(MAX_STATIC_VERTS * 6);
+const dynData    = new Float32Array(MAX_DYN_VERTS * 6);
+let staticCount = 0;   // 顶点数（非浮点数）
+let dynCount = 0;
 
-const vbo = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-gl.bufferData(gl.ARRAY_BUFFER, vertexData.byteLength, gl.DYNAMIC_DRAW);
+const staticVBO = gl.createBuffer();
+const dynVBO    = gl.createBuffer();
+
+// 当前写入目标（由 push* 使用）
+let writeBuf = null;     // Float32Array
+let writeMax = 0;        // 最大浮点数
+let vp = 0;              // 当前写入浮点索引
+
+function setWriteTarget(buf, maxFloats) {
+  writeBuf = buf;
+  writeMax = maxFloats;
+  vp = 0;
+}
 
 /* ============================================================
- *  等距投影
+ *  等距投影（修复项：scale 缓存）
  * ============================================================ */
 let canvasW = 1, canvasH = 1;
+let projScale = 1;       // 每帧或相机变化时算一次
+const camSin = { v: 0 }, camCos = { v: 1 };
+
+function updateCameraCache() {
+  projScale = Math.min(canvasW / 45, canvasH / 37) * zoom;
+  camSin.v = Math.sin(angle);
+  camCos.v = Math.cos(angle);
+}
 
 function project(x, z, h) {
-  const scale = Math.min(canvasW / 45, canvasH / 37) * zoom;
-  const ca = Math.cos(angle), sa = Math.sin(angle);
-  const rx = x * ca - z * sa;
-  const rz = x * sa + z * ca;
+  const rx = x * camCos.v - z * camSin.v;
+  const rz = x * camSin.v + z * camCos.v;
   return [
-    canvasW / 2 + rx * scale,
-    canvasH * 0.55 + rz * scale * tilt - h * scale
+    canvasW / 2 + rx * projScale,
+    canvasH * 0.55 + rz * projScale * tilt - h * projScale
   ];
 }
 
@@ -507,15 +546,19 @@ function toClip(px, py) {
 }
 
 /* ============================================================
- *  颜色工具
+ *  颜色工具（修复项 10：启用 hexCache）
  * ============================================================ */
 const hexCache = new Map();
 function rgb(r, g, b) {
   return [r / 255, g / 255, b / 255];
 }
 function hex2rgb(hex) {
+  let v = hexCache.get(hex);
+  if (v) return v;
   const n = parseInt(hex.slice(1), 16);
-  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+  v = [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+  hexCache.set(hex, v);
+  return v;
 }
 
 const COL_HEX = {
@@ -531,47 +574,58 @@ const COL_HEX = {
   sideEdge:      '#111910',
   topEdge:       '#232d20',
   rodDot:        '#404735',
-  edge:          '#0d1409'
-}
+  edge:          '#0d1409'   // ← 修复项 1
+};
 
-// 运行时数组镜像，使用处仍写 COL.xxx
 const COL = Object.fromEntries(
   Object.entries(COL_HEX).map(([k, v]) => [k, hex2rgb(v)])
 );
 
 /* ============================================================
- *  几何生成
+ *  顶点写入工具
  * ============================================================ */
-let vp = 0;
-
 function pushVertex(px, py, col) {
-  const clip = toClip(px, py);
-  vertexData[vp++] = clip[0];
-  vertexData[vp++] = clip[1];
-  vertexData[vp++] = 0;
-  vertexData[vp++] = col[0];
-  vertexData[vp++] = col[1];
-  vertexData[vp++] = col[2];
+  // 越界保护 + 一次性警告
+  if (vp + 6 > writeMax) {
+    if (!vertOverflowWarned) {
+      vertOverflowWarned = true;
+      console.warn(
+        'vertex buffer overflow:\n' +
+        '  used: ' + (vp / 6) + ' vert\n' +
+        '  max: ' + (writeMax / 6) + ' vert'
+      );
+    }
+    return;
+  }
+  const cx = (px / canvasW) * 2 - 1;
+  const cy = 1 - (py / canvasH) * 2;
+  const b = writeBuf;
+  b[vp++] = cx;
+  b[vp++] = cy;
+  b[vp++] = 0;
+  b[vp++] = col[0];
+  b[vp++] = col[1];
+  b[vp++] = col[2];
 }
 
 function pushEdge(p1, p2, color, edgeWidth) {
-  const deltaX = p2[0] - p1[0];
-  const deltaY = p2[1] - p1[1];
-  const length = Math.hypot(deltaX, deltaY) || 1;
-  const nX = -deltaY / length * edgeWidth * 0.5;
-  const nY =  deltaX / length * edgeWidth * 0.5;
+  const dx = p2[0] - p1[0];
+  const dy = p2[1] - p1[1];
+  const len = Math.hypot(dx, dy) || 1;
+  const nX = -dy / len * edgeWidth * 0.5;
+  const nY =  dx / len * edgeWidth * 0.5;
 
-  const A = [p1[0] + nX, p1[1] + nY];
-  const B = [p2[0] + nX, p2[1] + nY];
-  const C = [p2[0] - nX, p2[1] - nY];
-  const D = [p1[0] - nX, p1[1] - nY];
+  const A0 = [p1[0] + nX, p1[1] + nY];
+  const B0 = [p2[0] + nX, p2[1] + nY];
+  const C0 = [p2[0] - nX, p2[1] - nY];
+  const D0 = [p1[0] - nX, p1[1] - nY];
 
-  pushVertex(A[0], A[1], color);
-  pushVertex(B[0], B[1], color);
-  pushVertex(C[0], C[1], color);
-  pushVertex(A[0], A[1], color);
-  pushVertex(C[0], C[1], color);
-  pushVertex(D[0], D[1], color);
+  pushVertex(A0[0], A0[1], color);
+  pushVertex(B0[0], B0[1], color);
+  pushVertex(C0[0], C0[1], color);
+  pushVertex(A0[0], A0[1], color);
+  pushVertex(C0[0], C0[1], color);
+  pushVertex(D0[0], D0[1], color);
 }
 
 function pushQuad(p1, p2, p3, p4, col) {
@@ -583,7 +637,6 @@ function pushQuad(p1, p2, p3, p4, col) {
   pushVertex(p4[0], p4[1], col);
 }
 
-// 圆盘近似（用三角扇形），用于精细圆点
 function pushDisc(cx, cy, rx, ry, col, SEG) {
   SEG = SEG || 24;
   for (let i = 0; i < SEG; i++) {
@@ -596,8 +649,161 @@ function pushDisc(cx, cy, rx, ry, col, SEG) {
 }
 
 /* ============================================================
- *  尺寸 & Bloom 初始化
+ *  静态几何构建（修复项 3、4）
+ *  外圈 + 刻度 + 每根棒的底座 quad 只在相机 / 视口变化时重建
  * ============================================================ */
+function buildStaticGeometry() {
+  updateCameraCache();
+  setWriteTarget(staticData, staticData.length);
+
+  // 1. 外圈环（修复项 4：像素宽度语义）
+  function drawRing(radius, colorHex, widthPx) {
+    const ringColor = hex2rgb(colorHex);
+    const halfWidth = (widthPx * 0.5) / projScale;
+    const step = 96;
+    for (let i = 0; i < step; i++) {
+      const a0 = i / step * Math.PI * 2;
+      const a1 = (i + 1) / step * Math.PI * 2;
+      const c0 = Math.cos(a0), s0 = Math.sin(a0);
+      const c1 = Math.cos(a1), s1 = Math.sin(a1);
+      const ri = radius - halfWidth;
+      const ro = radius + halfWidth;
+      const p0i = project(c0 * ri, s0 * ri, 0);
+      const p1i = project(c1 * ri, s1 * ri, 0);
+      const p0o = project(c0 * ro, s0 * ro, 0);
+      const p1o = project(c1 * ro, s1 * ro, 0);
+      pushQuad(p0i, p1i, p1o, p0o, ringColor);
+    }
+  }
+
+  drawRing(16.4, '#060b07', 20);
+  drawRing(16.5, '#505948',  2);
+  drawRing(16.0, '#878969',  1);
+  drawRing(17.3, '#303a2d',  1);
+
+  // 2. 80 刻度块
+  for (let i = 0; i < 80; i++) {
+    const a = i / 80 * Math.PI * 2;
+    const a2 = a + 0.034;
+    const r0 = 15.7, r1 = 16.15;
+    const p1 = project(Math.cos(a) * r0, Math.sin(a) * r0, 0);
+    const p2 = project(Math.cos(a2) * r0, Math.sin(a2) * r0, 0);
+    const p3 = project(Math.cos(a2) * r1, Math.sin(a2) * r1, 0);
+    const p4 = project(Math.cos(a) * r1, Math.sin(a) * r1, 0);
+    pushQuad(p1, p2, p3, p4, (i % 2 === 1) ? COL.tickA : COL.tickB);
+  }
+
+  // 3. 每根棒的底座顶面（h=0 时的 a0/b0/c0/d0）—— 静态
+  const half = 0.44;
+  for (let i = 0; i < N; i++) {
+    const rod = rods[i];
+    const x = rod.x, z = rod.z;
+    const a0 = project(x - half, z - half, 0);
+    const b0 = project(x + half, z - half, 0);
+    const c0 = project(x + half, z + half, 0);
+    const d0 = project(x - half, z + half, 0);
+    rod._p0 = [a0, b0, c0, d0];   // 缓存，供动态部分复用
+  }
+
+  staticCount = vp / 6;
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, staticVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, staticData.subarray(0, vp), gl.STATIC_DRAW);
+  
+  // ← 新增：静态几何重建时同步更新深度排序（深度排序只随 angle 变）
+  const sinA = camSin.v, cosA = camCos.v;
+  sortedRods = [...rods].sort((a, b) =>
+    (a.x * sinA + a.z * cosA) - (b.x * sinA + b.z * cosA)
+  );
+}
+
+/* ============================================================
+ *  动态几何构建（棒的顶面 / 侧面 / 边 / 圆点）
+ * ============================================================ */
+function buildDynamicGeometry() {
+  setWriteTarget(dynData, dynData.length);
+  updateCameraCache();
+
+  // 深度排序（修复：按 angle 排序，只在相机变化时才需要重排；
+  // 此处保留每帧排序以便未来支持棒高度影响顺序时扩展，但用缓存 sin/cos）
+  const sinA = camSin.v, cosA = camCos.v;
+  const sorted = sortedRods;
+
+  const half = 0.44;
+  const dotSize = projScale * 0.12;
+  const edgeWidth = Math.max(0.8 * zoom, 1);
+  const sa = sinA, ca = cosA;
+
+
+  for (let s = 0; s < sorted.length; s++) {
+    const rod = sorted[s];
+    const amp = rod._amp || 0;
+    const h = rod.h;
+    const x = rod.x, z = rod.z;
+
+    const a = project(x - half, z - half, h);
+    const b = project(x + half, z - half, h);
+    const c = project(x + half, z + half, h);
+    const d = project(x - half, z + half, h);
+    const [a0, b0, c0, d0] = rod._p0;
+
+    // 4 个侧面
+    pushQuad(a, b, b0, a0, COL.side1);
+    pushQuad(b, c, c0, b0, rgb(55 + amp * 30, 62 + amp * 30, 44 + amp * 20));
+    pushQuad(c, d, d0, c0, COL.side3);
+    pushQuad(d, a, a0, d0, COL.side4);
+
+    // 改为直接用 seed 重算一次（更稳）
+    const seed = rod.seed;
+    const top = seed > 0.92 ? [143, 109, 81]
+              : seed > 0.85 ? [97, 118, 104]
+              : [139 + seed * 29, 148 + seed * 22, 119 + seed * 21];
+    pushQuad(a, b, c, d, rgb(
+      top[0] + amp * 43,
+      top[1] + amp * 40,
+      top[2] + amp * 24
+    ));
+
+    // 顶面 4 边
+    pushEdge(a, b, COL.edge, edgeWidth);
+    pushEdge(b, c, COL.edge, edgeWidth);
+    pushEdge(c, d, COL.edge, edgeWidth);
+    pushEdge(d, a, COL.edge, edgeWidth);
+
+    // 朝镜头的竖棱
+    const depthA = -sa - ca, depthB = sa - ca, depthC = sa + ca, depthD = -sa + ca;
+    const faces = [
+      { front: (depthA + depthB) > (depthC + depthD), edge1: [a, a0], edge2: [b, b0] },
+      { front: (depthB + depthC) > (depthD + depthA), edge1: [b, b0], edge2: [c, c0] },
+      { front: (depthC + depthD) > (depthA + depthB), edge1: [c, c0], edge2: [d, d0] },
+      { front: (depthD + depthA) > (depthB + depthC), edge1: [d, d0], edge2: [a, a0] },
+    ];
+    const seen = new Set();
+    for (const f of faces) {
+      if (!f.front) continue;
+      for (const e of [f.edge1, f.edge2]) {
+        const key = e[0] === a ? 'a' : e[0] === b ? 'b' : e[0] === c ? 'c' : 'd';
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pushEdge(e[0], e[1], COL.edge, edgeWidth);
+      }
+    }
+
+    // 圆点
+    const dotPos = project(x, z, h + 0.01);
+    pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * tilt, COL.rodDot, 32);
+  }
+
+  dynCount = vp / 6;
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, dynVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, dynData.subarray(0, vp), gl.DYNAMIC_DRAW);
+}
+
+/* ============================================================
+ *  尺寸
+ * ============================================================ */
+
 function size() {
   const rect = canvas.getBoundingClientRect();
   const d = Math.min(devicePixelRatio || 1, 2);
@@ -607,16 +813,16 @@ function size() {
   canvasH = canvas.clientHeight;
   gl.viewport(0, 0, canvas.width, canvas.height);
 
-  // Bloom 尺寸同步
   Bloom.resize(canvas.width, canvas.height);
 
   const srect = spec.getBoundingClientRect();
   spec.width = Math.max(1, Math.round(srect.width * d));
   spec.height = Math.max(1, Math.round(srect.height * d));
   sg.setTransform(d, 0, 0, d, 0, 0);
+
+  staticDirty = true;   // 视口变化 → 静态几何重建
 }
 
-// 先设初始尺寸，再初始化 Bloom（Bloom.init 内部会调 resize）
 canvasW = canvas.clientWidth || 800;
 canvasH = canvas.clientHeight || 600;
 Bloom.init(gl, Math.max(1, canvas.width || 800), Math.max(1, canvas.height || 600), { sceneHasAlpha: true });
@@ -642,15 +848,13 @@ function frame(t) {
   if (analyser && playing) analyser.getByteFrequencyData(bins);
   let peak = 0, peakIndex = 0;
   let fundPeak = 0, fundIndex = 0;
-  
+
   if (playing && bins) {
-    // 基础频率
     for (let i = 2; i < bins.length - 2; i++) {
       if (bins[i] > fundPeak) { fundPeak = bins[i]; fundIndex = i; }
     }
     smoothPeakIndex = smoothPeakIndex * smooth + fundIndex * (1.0 - smooth);
 
-    // 峰值频率（300Hz 以上找最大值）
     const sampleRate = ctx ? ctx.sampleRate : 44100;
     const binHz = sampleRate / FFTSize;
     const startHigh = Math.floor(300 / binHz);
@@ -658,9 +862,8 @@ function frame(t) {
       if (bins[i] > peak) { peak = bins[i]; peakIndex = i; }
     }
     smoothfundPeakIndex = smoothfundPeakIndex * smooth + peakIndex * (1.0 - smooth);
-    
   }
-  
+
   energy = 0;
   if (playing && wave) {
     analyser.getFloatTimeDomainData(wave);
@@ -668,9 +871,9 @@ function frame(t) {
     energy = Math.sqrt(energy / wave.length);
   }
 
-  // ---- Bloom 动态参数（和音频能量联动） ----
-  const bloomIntensity = Math.min(3.00,1.35 + energy * 0.75);
-  const bloomThreshold = Math.max(0.15,0.40 - energy * 0.25);
+  // ---- Bloom 动态参数 ----
+  const bloomIntensity = Math.min(3.00, 1.35 + energy * 0.75);
+  const bloomThreshold = Math.max(0.15, 0.40 - energy * 0.25);
   Bloom.setParams({
     intensity: bloomIntensity,
     threshold: bloomThreshold,
@@ -697,151 +900,45 @@ function frame(t) {
     rod.h += (target - rod.h) * (1 - Math.pow(0.45 + smoothing * 0.53, dt));
   }
 
-  // ---- 写顶点 ----
-  vp = 0;
-
-  // 1. 外圈环
-  function drawRing(radius, colorHex, widthPx) {
-    const ringColor = hex2rgb(colorHex);
-    const scale = Math.min(canvasW / 45, canvasH / 37) * zoom;
-    const halfWidth = (widthPx * 0.5) / scale;
-    const step = 96;
-    for (let i = 0; i < step; i++) {
-      const a0 = i / step * Math.PI * 2;
-      const a1 = (i + 1) / step * Math.PI * 2;
-      const c0 = Math.cos(a0), s0 = Math.sin(a0);
-      const c1 = Math.cos(a1), s1 = Math.sin(a1);
-      const radInner = radius - halfWidth;
-      const radOuter = radius + halfWidth;
-      const p0i = project(c0 * radInner, s0 * radInner, 0);
-      const p1i = project(c1 * radInner, s1 * radInner, 0);
-      const p0o = project(c0 * radOuter, s0 * radOuter, 0);
-      const p1o = project(c1 * radOuter, s1 * radOuter, 0);
-      pushQuad(p0i, p1i, p1o, p0o, ringColor);
-    }
+  // ---- 几何重建 ----
+  if (staticDirty) {
+    buildStaticGeometry();
+    staticDirty = false;
   }
-
-  drawRing(16.4, '#060b07', 60 * (Math.min(canvasW / 45, canvasH / 37) * zoom) * 0.02);
-  drawRing(16.5, '#505948',  6 * (Math.min(canvasW / 45, canvasH / 37) * zoom) * 0.02);
-  drawRing(16.0, '#878969',  3 * (Math.min(canvasW / 45, canvasH / 37) * zoom) * 0.02);
-  drawRing(17.3, '#303a2d',  3 * (Math.min(canvasW / 45, canvasH / 37) * zoom) * 0.02);
-
-  // 2. 80 刻度块
-  for (let i = 0; i < 80; i++) {
-    const a = i / 80 * Math.PI * 2;
-    const a2 = a + 0.034;
-    const r0 = 15.7, r1 = 16.15;
-    const p1 = project(Math.cos(a) * r0, Math.sin(a) * r0, 0);
-    const p2 = project(Math.cos(a2) * r0, Math.sin(a2) * r0, 0);
-    const p3 = project(Math.cos(a2) * r1, Math.sin(a2) * r1, 0);
-    const p4 = project(Math.cos(a) * r1, Math.sin(a) * r1, 0);
-    const col = (i % 2 === 1) ? COL.tickA : COL.tickB;
-    pushQuad(p1, p2, p3, p4, col);
-  }
-
-  // 3. 柱子（深度排序）
-  const sorted = [...rods].sort((a, b) =>
-    (a.x * Math.sin(angle) + a.z * Math.cos(angle)) -
-    (b.x * Math.sin(angle) + b.z * Math.cos(angle))
-  );
-
-  const halfSize = 0.44;
-  const dotSize = Math.min(canvasW / 45, canvasH / 37) * zoom * 0.12;
-
-  for (const rod of sorted) {
-    const amp = rod._amp || 0;
-    const h = rod.h;
-    const x = rod.x, z = rod.z;
-
-    const a0 = project(x - halfSize, z - halfSize, 0);
-    const b0 = project(x + halfSize, z - halfSize, 0);
-    const c0 = project(x + halfSize, z + halfSize, 0);
-    const d0 = project(x - halfSize, z + halfSize, 0);
-    const a  = project(x - halfSize, z - halfSize, h);
-    const b  = project(x + halfSize, z - halfSize, h);
-    const c  = project(x + halfSize, z + halfSize, h);
-    const d  = project(x - halfSize, z + halfSize, h);
-
-    pushQuad(a, b, b0, a0, COL.side1);
-    pushQuad(b, c, c0, b0, rgb(55 + amp * 30, 62 + amp * 30, 44 + amp * 20));
-    pushQuad(c, d, d0, c0, COL.side3);
-    pushQuad(d, a, a0, d0, COL.side4);
-
-    const seed = rod.seed;
-    let base;
-    if (seed > 0.92) base = [143, 109, 81];
-    else if (seed > 0.85) base = [97, 118, 104];
-    else base = [139 + seed * 29, 148 + seed * 22, 119 + seed * 21];
-    pushQuad(a, b, c, d, rgb(
-      base[0] + amp * 43,
-      base[1] + amp * 40,
-      base[2] + amp * 24
-    ));
-
-    // 顶面 4 边
-    const edgeWidth = Math.max(0.8 * zoom, 1);
-    const edgeColor = COL.edge;
-    pushEdge(a, b, edgeColor, edgeWidth);
-    pushEdge(b, c, edgeColor, edgeWidth);
-    pushEdge(c, d, edgeColor, edgeWidth);
-    pushEdge(d, a, edgeColor, edgeWidth);
-
-    // 朝镜头的两根竖棱
-    const sa = Math.sin(angle), ca = Math.cos(angle);
-    const depthA = -sa - ca, depthB = sa - ca, depthC = sa + ca, depthD = -sa + ca;
-
-    // 每个侧面由两个角和它们对应的底角组成
-    // 面法线的深度分量：面 (p,q) 的外法线深度 ∝ (depthP - depthQ) 的某种组合
-    // 对等距投影，面 a-b 朝镜头 ⇔ depthA + depthB > depthC + depthD（即该面比对面更靠前）
-    const faces = [
-      { front: (depthA + depthB) > (depthC + depthD), edge1: [a, a0], edge2: [b, b0] }, // 面 a-b
-      { front: (depthB + depthC) > (depthD + depthA), edge1: [b, b0], edge2: [c, c0] }, // 面 b-c
-      { front: (depthC + depthD) > (depthA + depthB), edge1: [c, c0], edge2: [d, d0] }, // 面 c-d
-      { front: (depthD + depthA) > (depthB + depthC), edge1: [d, d0], edge2: [a, a0] }, // 面 d-a
-    ];
-    
-    // 收集朝镜头面的竖边，去重
-    const seen = new Set();
-    for (const f of faces) {
-      if (!f.front) continue;
-      for (const e of [f.edge1, f.edge2]) {
-        const key = e[0] === a ? 'a' : e[0] === b ? 'b' : e[0] === c ? 'c' : 'd';
-        if (seen.has(key)) continue;
-        seen.add(key);
-        pushEdge(e[0], e[1], edgeColor, edgeWidth);
-      }
-    }
-
-    // 圆点（精细圆盘）
-    const dotPos = project(x, z, h + 0.01);
-    pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * tilt, COL.rodDot, 24);
-  }
-
-  vertexCount = vp / 6;
+  buildDynamicGeometry();
 
   /* ==========================================================
    *  渲染：Bloom 包裹
    * ========================================================== */
-  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-  gl.bufferSubData(gl.ARRAY_BUFFER, 0, vertexData.subarray(0, vp));
-
   gl.disable(gl.DEPTH_TEST);
-
   Bloom.beginScene();
 
-  // 场景绘制
   gl.useProgram(prog);
-  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-  gl.enableVertexAttribArray(A.pos);
-  gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);
-  gl.enableVertexAttribArray(A.color);
-  gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);
-  gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
+
+  // 静态部分
+  if (staticCount > 0) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, staticVBO);
+    gl.enableVertexAttribArray(A.pos);
+    gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);
+    gl.enableVertexAttribArray(A.color);
+    gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);
+    gl.drawArrays(gl.TRIANGLES, 0, staticCount);
+  }
+
+  // 动态部分
+  if (dynCount > 0) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, dynVBO);
+    gl.enableVertexAttribArray(A.pos);
+    gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);
+    gl.enableVertexAttribArray(A.color);
+    gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);
+    gl.drawArrays(gl.TRIANGLES, 0, dynCount);
+  }
 
   Bloom.endScene();
 
   /* ==========================================================
-   *  频谱小图（Canvas 2D，独立于 WebGL）
+   *  频谱小图
    * ========================================================== */
   const sw = spec.clientWidth, sh = spec.clientHeight;
   sg.clearRect(0, 0, sw, sh);
@@ -858,7 +955,7 @@ function frame(t) {
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
     $('fund').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
     $('freq').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
-    
+
     if (playing && !seeking) {
       let seconds;
       if (buffer && mode === 'file') {
@@ -866,10 +963,10 @@ function frame(t) {
         seconds = (playStartOffset + elapsed) % buffer.duration;
         $('seek').value = seconds / buffer.duration * 100;
       } else {
-            seconds = offset + (ctx.currentTime - started);
+        seconds = offset + (ctx.currentTime - started);
       }
       $('elapsed').textContent = format(seconds);
-    }    
+    }
   }
   requestAnimationFrame(frame);
 }
@@ -881,7 +978,7 @@ function format(s) {
   return Math.floor(s / 60).toString().padStart(2, '0') + ':' +
          Math.floor(s % 60).toString().padStart(2, '0');
 }
-    
+
 async function audio() {
   if (!ctx) {
     ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -896,6 +993,8 @@ async function audio() {
     master.connect(ctx.destination);
   }
   await ctx.resume();
+  // 空闲时释放音频设备（修复项 7，与 V2 一致）
+  if (!playing && !loading && ctx.state === 'running') await ctx.suspend();
 }
 
 function stop() {
@@ -914,6 +1013,7 @@ function stop() {
     stream = null;
   }
   playing = false;
+  if (ctx?.state === 'running') ctx.suspend().catch(() => {});   // 修复项 7
   update();
 }
 
@@ -927,7 +1027,6 @@ function update() {
     : '待机 · ' + (mode === 'demo' ? '演示预览' : '已暂停');
   $('tracksub').textContent = playing ? '控制棒随频谱实时响应' : '点击播放，启动声场';
   $('seek').disabled = mode !== 'file';
-  window.__dbg = { gl, Bloom, prog, vbo, A, get vertexCount(){ return vertexCount; }, ext: gl.getExtension('EXT_disjoint_timer_query_webgl2') };
 }
 
 async function start() {
@@ -939,14 +1038,9 @@ async function start() {
     if (attempt !== session) return;
 
     if (mode === 'mic') {
-      const id = ++session;
-      loading = true;
       $('message').textContent = '等待麦克风授权…';
       const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (id !== session) {
-        s.getTracks().forEach(t => t.stop());
-        return;
-      }
+      if (attempt !== session) { s.getTracks().forEach(t => t.stop()); return; }
       stream = s;
       source = ctx.createMediaStreamSource(s);
       source.connect(analyser);
@@ -955,24 +1049,22 @@ async function start() {
     } else {
       master.gain.value = +$('volume').value / 100;
 
-    if (mode === 'file' && buffer) {
-      source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.loop = LOOP;
-      source.connect(analyser);
-      source.onended = () => {
-        if (LOOP) return;
-        stop();
-        offset = 0;
-        $('seek').value = 0;
-        $('elapsed').textContent = '00:00';
-      };
-      // ★ 用 offset（可能已 %= duration）作为起点
-      source.start(0, offset);
-          // ★ 记录本次播放的 ctx 时刻
-      playStartCtxTime = ctx.currentTime;
-      playStartOffset = offset;
-    } else {
+      if (mode === 'file' && buffer) {
+        source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.loop = LOOP;
+        source.connect(analyser);
+        source.onended = () => {
+          if (LOOP) return;
+          stop();
+          offset = 0;
+          $('seek').value = 0;
+          $('elapsed').textContent = '00:00';
+        };
+        source.start(0, offset);
+        playStartCtxTime = ctx.currentTime;
+        playStartOffset = offset;
+      } else {
         [55, 82.41, 110, 164.81, 220, 329.63, 440, 659.25].forEach((freq, i) => {
           const osc = ctx.createOscillator();
           const v = ctx.createGain();
@@ -999,12 +1091,13 @@ async function start() {
     playing = true;
     update();
   } catch (e) {
+    if (attempt !== session) return;
     stop();
     $('message').textContent = mode === 'mic'
       ? '无法访问麦克风，请检查浏览器权限，或导入音频。'
       : '无法播放此音频，请尝试其他文件。';
   } finally {
-    if (attempt === session || !playing) loading = false;
+    if (attempt === session) loading = false;
   }
 }
 
@@ -1015,11 +1108,11 @@ $('play').onclick = () => {
   if (playing) {
     if (buffer && mode === 'file') {
       const elapsed = ctx.currentTime - playStartCtxTime;
-      offset = (playStartOffset + elapsed) % buffer.duration;  // ← 取模，且用真实位置
+      offset = (playStartOffset + elapsed) % buffer.duration;
     } else {
       offset += ctx.currentTime - started;
     }
-    stop(); 
+    stop();
   } else start();
 };
 
@@ -1059,6 +1152,7 @@ $('file').onchange = async e => {
   $('message').textContent = '正在读取音频…';
   try {
     await audio();
+    if (id !== session) return;
     const decoded = await ctx.decodeAudioData(await f.arrayBuffer());
     if (id !== session) return;
     buffer = decoded;
@@ -1072,57 +1166,45 @@ $('file').onchange = async e => {
     loading = false;
     await start();
   } catch (err) {
+    if (id !== session) return;
+    stop();
     $('message').textContent = '无法读取该文件，请尝试 MP3 或 WAV 音频。';
   } finally {
-    loading = false;
-    //e.target.value = '';
+    if (id === session) loading = false;
   }
 };
 
 document.addEventListener('keydown', e => {
-  // ★ 按住重复触发直接忽略
   if (e.repeat) return;
-
   const el = document.activeElement;
   const tag = el?.tagName;
   const isTextInput =
     el && el !== document.body && el !== document.documentElement &&
-    (
-      tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
-      el.isContentEditable
-    );
-
+    (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable);
   if (isTextInput) return;
 
-  // ---- 空格：播放/暂停 ----
   if (e.code === 'Space') {
     e.preventDefault();
-    // ★ 额外保险：阻止事件继续传播，避免其他监听重复处理
     e.stopPropagation();
     $('play').click();
     return;
   }
 
-  // ---- 左右键：进度跳转 ----
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
   if (mode !== 'file' || !buffer) return;
-
   e.preventDefault();
 
   const STEP = 5;
   const dir = e.key === 'ArrowRight' ? 1 : -1;
   const cur = +$('seek').value / 100 * buffer.duration;
   const next = Math.max(0, Math.min(buffer.duration, cur + dir * STEP));
-
   $('seek').value = next / buffer.duration * 100;
   $('seek').dispatchEvent(new Event('input'));
   $('seek').dispatchEvent(new Event('change'));
 });
 
-
-
 $('seek').onkeydown = e => {
-  if (mode !== 'file' || !buffer) return;
+  if (mode !== 'file' || !buffer) {seeking = false;return};
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
   e.preventDefault();
   const STEP = 5;
@@ -1135,7 +1217,7 @@ $('seek').onkeydown = e => {
 };
 
 $('seek').oninput = () => {
-  if (mode !== 'file' || !buffer) return;
+  if (mode !== 'file' || !buffer) {seeking = false;return};
   seeking = true;
   $('elapsed').textContent = format(+$('seek').value / 100 * buffer.duration);
 };
@@ -1168,46 +1250,10 @@ $('volume').oninput = e => {
 
 /* 拖拽旋转 */
 canvas.addEventListener('pointerdown', e => {
-  const rect = canvas.getBoundingClientRect();
-  const cx = rect.left + rect.width / 2;
-  const cy = rect.top + rect.height * 0.55;
-
-  drag = { x: e.clientX, y: e.clientY, cx, cy };
-  canvas.setPointerCapture(e.pointerId);
-});
-
-canvas.addEventListener('pointermove', e => {
-  if (!drag) return;
-
-  // 用当前指针位置相对中心的偏移求极角
-  const dx = e.clientX - drag.cx;
-  const dy = e.clientY - drag.cy;
-  const r = Math.hypot(dx, dy) || 1;
-
-  // 指针在圆盘"前侧"时 dy>0，后侧 dy<0；
-  // 用 dy/r 作为连续权重，范围 [-1, 1]：
-  //   前侧(dy>0) → 权重为负（angle -=）
-  //   后侧(dy<0) → 权重为正（angle +=）
-  //   左右两侧(dy≈0) → 权重≈0，旋转平滑经过 0，不会突跳
-  const frontWeight = -dy / r;   // 前侧为负，后侧为正
-
-  const dxMove = e.clientX - drag.x;
-  angle += frontWeight * dxMove * 0.006;
-
-  // 指针太靠近中心时 frontWeight 抖动大，做个下限保护
-  // （可选：只在离中心足够远时才应用）
-
-  tilt = Math.max(0.3, Math.min(0.8, tilt + (e.clientY - drag.y) * 0.005));
-
-  drag.x = e.clientX;
-  drag.y = e.clientY;
-});
-
-/*
-canvas.addEventListener('pointerdown', e => {
   drag = { x: e.clientX, y: e.clientY };
   canvas.setPointerCapture(e.pointerId);
 });
+
 canvas.addEventListener('pointermove', e => {
   if (!drag) return;
 
@@ -1224,8 +1270,8 @@ canvas.addEventListener('pointermove', e => {
 
   tilt = Math.max(0.3, Math.min(0.8, tilt + (e.clientY - drag.y) * 0.005));
   drag = { x: e.clientX, y: e.clientY };
+  staticDirty = true;   // ← 保留：角度变了要重建静态几何 + 排序
 });
-*/
 
 canvas.addEventListener('pointerup', () => drag = null);
 canvas.addEventListener('pointercancel', () => drag = null);
@@ -1233,12 +1279,14 @@ canvas.addEventListener('pointercancel', () => drag = null);
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   zoom = Math.max(0.5, Math.min(2.2, zoom - e.deltaY * 0.001));
+  staticDirty = true;
 }, { passive: false });
 
 $('reset').onclick = () => {
   angle = -0.32;
   tilt = 0.58;
   zoom = 1;
+  staticDirty = true;
 };
 
 $('fullscreen').onclick = async () => {
@@ -1263,49 +1311,15 @@ size();
 requestAnimationFrame(frame);
 
 $('ssaa').textContent = Bloom.ssaa + 'x';
-//$('msaa').textContent = Bloom.msaa + 'x';
-//$('bloomMode').textContent   = Bloom.mode;
 $('bloomLevels').textContent = Bloom.levels + 'x';
-//$('fftSize').textContent = FFTSize
 update();
 
-
 /* ============================================================
- *  可选：Model Context 工具注册
- * ============================================================ 
- *  这里暂时用不到
- 
-if (document.modelContext?.registerTool) {
-  try {
-    Promise.resolve(document.modelContext.registerTool({
-      name: 'configure_reactor_response',
-      description: 'Adjust the reactor audio visualizer sensitivity and motion smoothing.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sensitivity: { type: 'number', minimum: 0.3, maximum: 3 },
-          smoothing: { type: 'number', minimum: 0, maximum: 95 }
-        },
-        required: ['sensitivity', 'smoothing'],
-        additionalProperties: false
-      },
-      execute(input) {
-        if (!input ||
-            !Number.isFinite(input.sensitivity) || input.sensitivity < 0.3 || input.sensitivity > 3 ||
-            !Number.isFinite(input.smoothing) || input.smoothing < 0 || input.smoothing > 95)
-          throw Error('Invalid response settings');
-        $('gain').value = input.sensitivity;
-        $('gain').dispatchEvent(new Event('input'));
-        $('smooth').value = input.smoothing;
-        $('smooth').dispatchEvent(new Event('input'));
-        return { sensitivity: gain, smoothing: smoothing * 100 };
-      }
-    })).catch(() => {});
-  } catch (e) {}
-}
-*/
-
-
-/* 控制台里的GPU帧时间
-(() => {const { gl, Bloom, prog, vbo, A, ext } = window.__dbg;if (!ext) { console.warn('EXT_disjoint_timer_query_webgl2 不可用'); return; }const vertexCount = window.__dbg.vertexCount;if (!vertexCount) { console.warn('vertexCount 为 0，可能还没渲染过'); return; }const query = gl.createQuery();gl.beginQuery(ext.TIME_ELAPSED_EXT, query);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.disable(gl.DEPTH_TEST);Bloom.beginScene();gl.useProgram(prog);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.enableVertexAttribArray(A.pos);gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);gl.enableVertexAttribArray(A.color);gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);gl.drawArrays(gl.TRIANGLES, 0, vertexCount);Bloom.endScene();gl.endQuery(ext.TIME_ELAPSED_EXT);function poll() {const available = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);if (disjoint) { console.warn('GPU disjoint，丢弃'); gl.deleteQuery(query); return; }if (available) {const ms = gl.getQueryParameter(query, gl.QUERY_RESULT) / 1e6;const maxfps = 1000/ms;console.log('GPU 帧时间 (ms):', ms.toFixed(3));console.log('理论最大帧率 :', maxfps.toFixed(3));gl.deleteQuery(query);} else {requestAnimationFrame(poll);}}requestAnimationFrame(poll);})();
-*/
+ *  调试钩子（修复项 9：只建一次）
+ * ============================================================ */
+window.__dbg = {
+  gl, Bloom, prog, staticVBO, dynVBO, A,
+  get staticCount() { return staticCount; },
+  get dynCount()    { return dynCount; },
+  ext: gl.getExtension('EXT_disjoint_timer_query_webgl2')
+};
