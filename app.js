@@ -1018,7 +1018,6 @@ function stop() {
     stream = null;
   }
   playing = false;
-  if (ctx?.state === 'running') ctx.suspend().catch(() => {});   // 修复项 7
   update();
 }
 
