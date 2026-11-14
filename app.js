@@ -24,10 +24,9 @@ let playStartCtxTime = 0;
 let playStartOffset = 0;
 let LOOP = true;
 let vertOverflowWarned = false; // 顶点越界
-let staticDirty = true;
 let sortedRods = null;   // 缓存的深度排序结果
-const MAX_STATIC_VERTS = 8192; // 极限2784
-const MAX_DYN_VERTS    = 262144;   // 极限约102096
+let lastSortedAngle = NaN;
+const MAX_VERTS    = 262144;   // 极限约102096
 const FFTSize = 2048;
 const FBO_Bloom = 1;
 const FBO_SS = 2;
@@ -502,20 +501,16 @@ const Bloom = (function () {
 })();
 
 /* ============================================================
- *  顶点缓冲（修复项 3：静态 / 动态分离 + 越界保护）
+ *  顶点缓冲
  * ============================================================ */
-const staticData = new Float32Array(MAX_STATIC_VERTS * 6);
-const dynData    = new Float32Array(MAX_DYN_VERTS * 6);
-let staticCount = 0;   // 顶点数（非浮点数）
-let dynCount = 0;
+const vertData = new Float32Array(MAX_VERTS * 6);
+let vertCount = 0;
 
-const staticVBO = gl.createBuffer();
-const dynVBO    = gl.createBuffer();
+const vbo = gl.createBuffer();
 
-// 当前写入目标（由 push* 使用）
-let writeBuf = null;     // Float32Array
-let writeMax = 0;        // 最大浮点数
-let vp = 0;              // 当前写入浮点索引
+let writeBuf = null;
+let writeMax = 0;
+let vp = 0;
 
 function setWriteTarget(buf, maxFloats) {
   writeBuf = buf;
@@ -542,13 +537,6 @@ function project(x, z, h) {
   return [
     canvasW / 2 + rx * projScale,
     canvasH * 0.55 + rz * projScale * tilt - h * projScale
-  ];
-}
-
-function toClip(px, py) {
-  return [
-    (px / canvasW) * 2 - 1,
-    1 - (py / canvasH) * 2
   ];
 }
 
@@ -656,14 +644,21 @@ function pushDisc(cx, cy, rx, ry, col, SEG) {
 }
 
 /* ============================================================
- *  静态几何构建（修复项 3、4）
- *  外圈 + 刻度 + 每根棒的底座 quad 只在相机 / 视口变化时重建
+ *  几何构建（单缓冲：外圈 + 刻度 + 全部棒几何）
  * ============================================================ */
-function buildStaticGeometry() {
+function buildGeometry() {
   updateCameraCache();
-  setWriteTarget(staticData, staticData.length);
+  setWriteTarget(vertData, vertData.length);
+  
+  if (!sortedRods || angle !== lastSortedAngle) {
+    const sinA = Math.sin(angle), cosA = Math.cos(angle);
+    sortedRods = [...rods].sort((a, b) =>
+      (a.x * sinA + a.z * cosA) - (b.x * sinA + b.z * cosA)
+    );
+    lastSortedAngle = angle;
+  }
 
-  // 1. 外圈环（修复项 4：像素宽度语义）
+  // 1. 外圈环
   function drawRing(radius, colorHex, widthPx) {
     const ringColor = hex2rgb(colorHex);
     const halfWidth = (widthPx * 0.5) / projScale;
@@ -700,65 +695,35 @@ function buildStaticGeometry() {
     pushQuad(p1, p2, p3, p4, (i % 2 === 1) ? COL.tickA : COL.tickB);
   }
 
-  // 3. 每根棒的底座顶面（h=0 时的 a0/b0/c0/d0）—— 静态
+  // 3. 每根棒底座（缓存 _p0）+ 棒体
   const half = 0.44;
-  for (let i = 0; i < N; i++) {
-    const rod = rods[i];
-    const x = rod.x, z = rod.z;
-    const a0 = project(x - half, z - half, 0);
-    const b0 = project(x + half, z - half, 0);
-    const c0 = project(x + half, z + half, 0);
-    const d0 = project(x - half, z + half, 0);
-    rod._p0 = [a0, b0, c0, d0];   // 缓存，供动态部分复用
-  }
-
-  staticCount = vp / 6;
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, staticVBO);
-  gl.bufferData(gl.ARRAY_BUFFER, staticData.subarray(0, vp), gl.STATIC_DRAW);
-  
-  // ← 新增：静态几何重建时同步更新深度排序（深度排序只随 angle 变）
   const sinA = camSin.v, cosA = camCos.v;
-  sortedRods = [...rods].sort((a, b) =>
-    (a.x * sinA + a.z * cosA) - (b.x * sinA + b.z * cosA)
-  );
-}
-
-/* ============================================================
- *  动态几何构建（棒的顶面 / 侧面 / 边 / 圆点）
- * ============================================================ */
-function buildDynamicGeometry() {
-  setWriteTarget(dynData, dynData.length);
-  updateCameraCache();
-
-  const sinA = camSin.v, cosA = camCos.v;
-  const sorted = sortedRods;
-
-  const half = 0.44;
+  const sa = sinA, ca = cosA;
   const dotSize = projScale * 0.12;
   const edgeWidth = Math.max(0.8 * zoom, 1);
-  const sa = sinA, ca = cosA;
-
+  const sorted = sortedRods;
 
   for (let s = 0; s < sorted.length; s++) {
     const rod = sorted[s];
     const amp = rod._amp || 0;
     const h = rod.h;
     const x = rod.x, z = rod.z;
+    
+    const a0 = project(x - half, z - half, 0);
+    const b0 = project(x + half, z - half, 0);
+    const c0 = project(x + half, z + half, 0);
+    const d0 = project(x - half, z + half, 0);
 
     const a = project(x - half, z - half, h);
     const b = project(x + half, z - half, h);
     const c = project(x + half, z + half, h);
     const d = project(x - half, z + half, h);
-    const [a0, b0, c0, d0] = rod._p0;
 
-    // 4 个侧面
     pushQuad(a, b, b0, a0, COL.side1);
     pushQuad(b, c, c0, b0, rgb(55 + amp * 30, 62 + amp * 30, 44 + amp * 20));
     pushQuad(c, d, d0, c0, COL.side3);
     pushQuad(d, a, a0, d0, COL.side4);
 
-    // 改为直接用 seed 重算一次（更稳）
     const seed = rod.seed;
     const top = seed > 0.92 ? [143, 109, 81]
               : seed > 0.85 ? [97, 118, 104]
@@ -769,40 +734,32 @@ function buildDynamicGeometry() {
       top[2] + amp * 24
     ));
 
-    // 顶面 4 边
     pushEdge(a, b, COL.edge, edgeWidth);
     pushEdge(b, c, COL.edge, edgeWidth);
     pushEdge(c, d, COL.edge, edgeWidth);
     pushEdge(d, a, COL.edge, edgeWidth);
 
-    // 朝镜头的竖棱
     const depthA = -sa - ca, depthB = sa - ca, depthC = sa + ca, depthD = -sa + ca;
-    const faces = [
-      { front: (depthA + depthB) > (depthC + depthD), edge1: [a, a0], edge2: [b, b0] },
-      { front: (depthB + depthC) > (depthD + depthA), edge1: [b, b0], edge2: [c, c0] },
-      { front: (depthC + depthD) > (depthA + depthB), edge1: [c, c0], edge2: [d, d0] },
-      { front: (depthD + depthA) > (depthB + depthC), edge1: [d, d0], edge2: [a, a0] },
-    ];
-    const seen = new Set();
-    for (const f of faces) {
-      if (!f.front) continue;
-      for (const e of [f.edge1, f.edge2]) {
-        const key = e[0] === a ? 'a' : e[0] === b ? 'b' : e[0] === c ? 'c' : 'd';
-        if (seen.has(key)) continue;
-        seen.add(key);
-        pushEdge(e[0], e[1], COL.edge, edgeWidth);
-      }
-    }
+    const dAB = depthA + depthB, dCD = depthC + depthD;
+    const dBC = depthB + depthC, dDA = depthD + depthA;
+    const f1 = dAB > dCD;
+    const f2 = dBC > dDA;
+    const f3 = dCD > dAB;
+    const f4 = dDA > dBC;
 
-    // 圆点
+    if (f1 || f4) pushEdge(a, a0, COL.edge, edgeWidth);
+    if (f1 || f2) pushEdge(b, b0, COL.edge, edgeWidth);
+    if (f2 || f3) pushEdge(c, c0, COL.edge, edgeWidth);
+    if (f3 || f4) pushEdge(d, d0, COL.edge, edgeWidth);
+
     const dotPos = project(x, z, h + 0.01);
     pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * tilt, COL.rodDot, 32);
   }
 
-  dynCount = vp / 6;
+  vertCount = vp / 6;
 
-  gl.bindBuffer(gl.ARRAY_BUFFER, dynVBO);
-  gl.bufferData(gl.ARRAY_BUFFER, dynData.subarray(0, vp), gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, vertData.subarray(0, vp), gl.DYNAMIC_DRAW);
 }
 
 /* ============================================================
@@ -814,8 +771,8 @@ function size() {
   const d = Math.min(devicePixelRatio || 1, 2);
   canvas.width = Math.max(1, Math.round(rect.width * d));
   canvas.height = Math.max(1, Math.round(rect.height * d));
-  canvasW = canvas.clientWidth;
-  canvasH = canvas.clientHeight;
+  canvasW = Math.max(1, canvas.clientWidth);
+  canvasH = Math.max(1, canvas.clientHeight);
   gl.viewport(0, 0, canvas.width, canvas.height);
 
   Bloom.resize(canvas.width, canvas.height);
@@ -824,8 +781,6 @@ function size() {
   spec.width = Math.max(1, Math.round(srect.width * d));
   spec.height = Math.max(1, Math.round(srect.height * d));
   sg.setTransform(d, 0, 0, d, 0, 0);
-
-  staticDirty = true;   // 视口变化 → 静态几何重建
 }
 
 canvasW = canvas.clientWidth || 800;
@@ -853,19 +808,18 @@ function frame(t) {
   if (analyser && playing) analyser.getByteFrequencyData(bins);
   let peak = 0, peakIndex = 0;
   let fundPeak = 0, fundIndex = 0;
+  const sampleRate = ctx ? ctx.sampleRate : 44100;
+  const binHz = sampleRate / FFTSize;
 
   if (playing && bins) {
-    for (let i = 2; i < bins.length - 2; i++) {
-      if (bins[i] > fundPeak) { fundPeak = bins[i]; fundIndex = i; }
-    }
-    smoothPeakIndex = smoothPeakIndex * smooth + fundIndex * (1.0 - smooth);
-
-    const sampleRate = ctx ? ctx.sampleRate : 44100;
-    const binHz = sampleRate / FFTSize;
+    smoothfundPeakIndex = smoothfundPeakIndex * smooth + peakIndex * (1.0 - smooth);
     const startHigh = Math.floor(300 / binHz);
-    for (let i = startHigh; i < bins.length - 2; i++) {
-      if (bins[i] > peak) { peak = bins[i]; peakIndex = i; }
+    for (let i = 2; i < bins.length - 2; i++) {
+      const v = bins[i];
+      if (v > fundPeak) { fundPeak = v; fundIndex = i; }
+      if (i >= startHigh && v > peak) { peak = v; peakIndex = i; }
     }
+    smoothPeakIndex     = smoothPeakIndex     * smooth + fundIndex * (1.0 - smooth);
     smoothfundPeakIndex = smoothfundPeakIndex * smooth + peakIndex * (1.0 - smooth);
   }
 
@@ -886,9 +840,7 @@ function frame(t) {
   });
 
   // ---- 更新柱子高度 ----
-  const sampleRate = ctx ? ctx.sampleRate : 44100;
-  const binHz = sampleRate / FFTSize;
-
+  const smoothFactor = 1 - Math.pow(0.45 + smoothing * 0.53, dt);
   for (let i = 0; i < N; i++) {
     const rod = rods[i];
     let amp = 0;
@@ -902,15 +854,10 @@ function frame(t) {
     }
     rod._amp = amp;
     const target = 0.07 + amp * 4.8;
-    rod.h += (target - rod.h) * (1 - Math.pow(0.45 + smoothing * 0.53, dt));
+    rod.h += (target - rod.h) * smoothFactor;
   }
 
-  // ---- 几何重建 ----
-  if (staticDirty) {
-    buildStaticGeometry();
-    staticDirty = false;
-  }
-  buildDynamicGeometry();
+  buildGeometry();
 
   /* ==========================================================
    *  渲染：Bloom 包裹
@@ -919,25 +866,14 @@ function frame(t) {
   Bloom.beginScene();
 
   gl.useProgram(prog);
-
-  // 静态部分
-  if (staticCount > 0) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, staticVBO);
+  
+  if (vertCount > 0) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.enableVertexAttribArray(A.pos);
     gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);
     gl.enableVertexAttribArray(A.color);
     gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);
-    gl.drawArrays(gl.TRIANGLES, 0, staticCount);
-  }
-
-  // 动态部分
-  if (dynCount > 0) {
-    gl.bindBuffer(gl.ARRAY_BUFFER, dynVBO);
-    gl.enableVertexAttribArray(A.pos);
-    gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);
-    gl.enableVertexAttribArray(A.color);
-    gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);
-    gl.drawArrays(gl.TRIANGLES, 0, dynCount);
+    gl.drawArrays(gl.TRIANGLES, 0, vertCount);
   }
 
   Bloom.endScene();
@@ -1031,6 +967,11 @@ function update() {
     : '待机 · ' + (mode === 'demo' ? '演示预览' : '已暂停');
   $('tracksub').textContent = playing ? '控制棒随频谱实时响应' : '点击播放，启动声场';
   $('seek').disabled = mode !== 'file';
+  window.__dbg = {
+    gl, Bloom, prog, vbo, A,
+    get vertexCount() { return vertCount; },
+    ext: gl.getExtension('EXT_disjoint_timer_query_webgl2')
+  };
 }
 
 async function start() {
@@ -1227,7 +1168,7 @@ $('seek').oninput = () => {
 };
 
 $('seek').onchange = () => {
-  if (mode !== 'file' || !buffer) return;
+  if (mode !== 'file' || !buffer) {seeking = false;return};
   const was = playing;
   stop();
   offset = +$('seek').value / 100 * buffer.duration;
@@ -1274,7 +1215,6 @@ canvas.addEventListener('pointermove', e => {
 
   tilt = Math.max(0.3, Math.min(0.8, tilt + (e.clientY - drag.y) * 0.005));
   drag = { x: e.clientX, y: e.clientY };
-  staticDirty = true;   // ← 保留：角度变了要重建静态几何 + 排序
 });
 
 canvas.addEventListener('pointerup', () => drag = null);
@@ -1283,14 +1223,12 @@ canvas.addEventListener('pointercancel', () => drag = null);
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   zoom = Math.max(0.5, Math.min(2.2, zoom - e.deltaY * 0.001));
-  staticDirty = true;
 }, { passive: false });
 
 $('reset').onclick = () => {
   angle = -0.32;
   tilt = 0.58;
   zoom = 1;
-  staticDirty = true;
 };
 
 $('fullscreen').onclick = async () => {
@@ -1318,12 +1256,6 @@ $('ssaa').textContent = Bloom.ssaa + 'x';
 $('bloomLevels').textContent = Bloom.levels + 'x';
 update();
 
-/* ============================================================
- *  调试钩子（修复项 9：只建一次）
- * ============================================================ */
-window.__dbg = {
-  gl, Bloom, prog, staticVBO, dynVBO, A,
-  get staticCount() { return staticCount; },
-  get dynCount()    { return dynCount; },
-  ext: gl.getExtension('EXT_disjoint_timer_query_webgl2')
-};
+/* 控制台里的GPU帧时间
+(() => {const { gl, Bloom, prog, vbo, A, ext } = window.__dbg;if (!ext) { console.warn('EXT_disjoint_timer_query_webgl2 不可用'); return; }const vertexCount = window.__dbg.vertexCount;if (!vertexCount) { console.warn('vertexCount 为 0，可能还没渲染过'); return; }const query = gl.createQuery();gl.beginQuery(ext.TIME_ELAPSED_EXT, query);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.disable(gl.DEPTH_TEST);Bloom.beginScene();gl.useProgram(prog);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.enableVertexAttribArray(A.pos);gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);gl.enableVertexAttribArray(A.color);gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);gl.drawArrays(gl.TRIANGLES, 0, vertexCount);Bloom.endScene();gl.endQuery(ext.TIME_ELAPSED_EXT);function poll() {const available = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);if (disjoint) { console.warn('GPU disjoint，丢弃'); gl.deleteQuery(query); return; }if (available) {const ms = gl.getQueryParameter(query, gl.QUERY_RESULT) / 1e6;const maxfps = 1000/ms;console.log('GPU 帧时间 (ms):', ms.toFixed(3));console.log('理论最大帧率 :', maxfps.toFixed(3));gl.deleteQuery(query);} else {requestAnimationFrame(poll);}}requestAnimationFrame(poll);})();
+*/
