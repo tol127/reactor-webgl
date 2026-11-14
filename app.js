@@ -894,8 +894,8 @@ function frame(t) {
   // ---- 读数 ----
   if (t % 100 < 25) {
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
-    $('fund').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
-    $('freq').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    $('freq').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    $('fund').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
 
     if (playing && !seeking) {
       let seconds;
