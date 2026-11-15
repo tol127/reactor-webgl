@@ -26,24 +26,29 @@ let LOOP = true;
 let sortedRods = null;   // 缓存的深度排序结果
 let lastSortedAngle = NaN;
 
-const MAX_VERTS    = 130172 * 4;   // 极限约125000 * (SCALE ^ 2)
 const FFTSize = 2048;
 const FBO_Bloom = 1;
 const FBO_SS = 2;
 const EAT_BLOOM = false;
-const SCALE = 1.0
+const SCALE = 1;
+const MAXHZ = 16500; //视频网站常见16khz截断，不建议超过 采样率/2（通常为44.1Khz / 2 = 22050Hz）
+let MAX_VERTS = 125000 * SCALE * SCALE;
+
+//顶点补充：
+//若MAX_VERTS    再次 x2，SCALE < 0.15 时顶点越界（现状）
+//若MAX_VERTS 不 再次 x2，SCALE < 0.66 时顶点越界
+
+zoom /= SCALE;
 
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.0';
+const VERSION = '1.7.1';
 const DATE = '2026-11-15';
 
 /*
 主要更新内容：
-1.project()重写
-2.tilt范围扩大
-3.全局缩放因子 scale
+1.频率上限MAXHZ
 */
 
 
@@ -513,6 +518,7 @@ const Bloom = (function () {
  * ============================================================ */
 const vertData = new Float32Array(MAX_VERTS * 6);
 let vertCount = 0;
+let vertNeeded = 0;
 
 const vbo = gl.createBuffer();
 
@@ -601,16 +607,9 @@ const COL = Object.fromEntries(
  * ============================================================ */
 let vertOverflowWarned = false; // 顶点越界
 function pushVertex(px, py, col) {
+  vertNeeded++;
   // 越界保护 + 一次性警告
-  if (vp + 6 > writeMax) {
-    if (!vertOverflowWarned) {
-      vertOverflowWarned = true;
-      console.warn(
-        'vertex buffer overflow: ' + (vp / 6) + '/' + (writeMax / 6)
-      );
-    }
-    return;
-  }
+  if (vp + 6 > writeMax) return;
   const cx = (px / canvasW) * 2 - 1;
   const cy = 1 - (py / canvasH) * 2;
   const b = writeBuf;
@@ -668,6 +667,7 @@ function pushDisc(cx, cy, rx, ry, col, SEG) {
 function buildGeometry() {
   updateCameraCache();
   setWriteTarget(vertData, vertData.length);
+  vertNeeded = 0;
   
   if (!sortedRods || angle !== lastSortedAngle) {
     const sinA = Math.sin(angle), cosA = Math.cos(angle);
@@ -779,6 +779,13 @@ function buildGeometry() {
 
   gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
   gl.bufferData(gl.ARRAY_BUFFER, vertData.subarray(0, vp), gl.DYNAMIC_DRAW);
+  
+  if (vertNeeded > writeMax / 6 && !vertOverflowWarned) {
+    vertOverflowWarned = true;
+    console.warn(
+      'vertex buffer overflow: ' + vertNeeded + '/' + (writeMax / 6)
+    );
+  }
 }
 
 /* ============================================================
@@ -867,7 +874,7 @@ function frame(t) {
     const rod = rods[i];
     let amp = 0;
     if (playing && bins) {
-      const hz = 45 * Math.pow(320, rod.r / 15 / SCALE);
+      const hz = 45 * Math.pow(MAXHZ / 45, rod.r / 15 / SCALE);
       const idx = Math.max(1, Math.min(bins.length - 2, Math.round(hz / binHz)));
       amp = (bins[idx] + bins[idx - 1] + bins[idx + 1]) / 765;
       amp = Math.pow(amp, 1.7) * gain;
@@ -1252,13 +1259,13 @@ canvas.addEventListener('pointercancel', () => drag = null);
 
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
-  zoom = Math.max(0.5, Math.min(2.2, zoom - e.deltaY * 0.001));
+  zoom = Math.max(0.5 / (SCALE), Math.min(2.2, zoom - e.deltaY * 0.001));
 }, { passive: false });
 
 $('reset').onclick = () => {
   angle = -0.4;
   tilt = 0.6;
-  zoom = 1.05;
+  zoom = 1.05 / SCALE;
 };
 
 $('fullscreen').onclick = async () => {
