@@ -23,7 +23,6 @@ let fpsLast = 0, fpsFrames = 0;
 let playStartCtxTime = 0;
 let playStartOffset = 0;
 let LOOP = true;
-let vertOverflowWarned = false; // 顶点越界
 let sortedRods = null;   // 缓存的深度排序结果
 let lastSortedAngle = NaN;
 const MAX_VERTS    = 262144;   // 极限约102096
@@ -32,12 +31,18 @@ const FBO_Bloom = 1;
 const FBO_SS = 2;
 const EAT_BLOOM = false;
 
+/* ============================================================
+ *  版本
+ * ============================================================ */
+const VERSION = '1.6.2';
+const DATE = '2026-11-15';
+
 /*
 更新内容：
-1.EAT_BLOOM
-2.EAT_BLOOM
-3.EAT_BLOOM
+1.版本号
+2.再次撤销优化
 */
+
 
 /* ============================================================
  *  控制棒数据
@@ -579,15 +584,14 @@ const COL = Object.fromEntries(
 /* ============================================================
  *  顶点写入工具
  * ============================================================ */
+let vertOverflowWarned = false; // 顶点越界
 function pushVertex(px, py, col) {
   // 越界保护 + 一次性警告
   if (vp + 6 > writeMax) {
     if (!vertOverflowWarned) {
       vertOverflowWarned = true;
       console.warn(
-        'vertex buffer overflow:\n' +
-        '  used: ' + (vp / 6) + ' vert\n' +
-        '  max: ' + (writeMax / 6) + ' vert'
+        'vertex buffer overflow: ' + (vp / 6) + '/' + (writeMax / 6)
       );
     }
     return;
@@ -812,14 +816,19 @@ function frame(t) {
   const binHz = sampleRate / FFTSize;
 
   if (playing && bins) {
-    smoothfundPeakIndex = smoothfundPeakIndex * smooth + peakIndex * (1.0 - smooth);
-    const startHigh = Math.floor(300 / binHz);
+    // 基础频率
     for (let i = 2; i < bins.length - 2; i++) {
-      const v = bins[i];
-      if (v > fundPeak) { fundPeak = v; fundIndex = i; }
-      if (i >= startHigh && v > peak) { peak = v; peakIndex = i; }
+      if (bins[i] > fundPeak) { fundPeak = bins[i]; fundIndex = i; }
     }
-    smoothPeakIndex     = smoothPeakIndex     * smooth + fundIndex * (1.0 - smooth);
+    smoothPeakIndex = smoothPeakIndex * smooth + fundIndex * (1.0 - smooth);
+
+    // 峰值频率（300Hz 以上找最大值）
+    const sampleRate = ctx ? ctx.sampleRate : 44100;
+    const binHz = sampleRate / FFTSize;
+    const startHigh = Math.floor(300 / binHz);
+    for (let i = startHigh; i < bins.length - 2; i++) {
+      if (bins[i] > peak) { peak = bins[i]; peakIndex = i; }
+    }
     smoothfundPeakIndex = smoothfundPeakIndex * smooth + peakIndex * (1.0 - smooth);
   }
 
@@ -893,9 +902,10 @@ function frame(t) {
 
   // ---- 读数 ----
   if (t % 100 < 25) {
+    //屎山勿动
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
-    $('freq').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
-    $('fund').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    $('fund').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    $('freq').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
 
     if (playing && !seeking) {
       let seconds;
@@ -934,8 +944,6 @@ async function audio() {
     master.connect(ctx.destination);
   }
   await ctx.resume();
-  // 空闲时释放音频设备（修复项 7，与 V2 一致）
-  if (!playing && !loading && ctx.state === 'running') await ctx.suspend();
 }
 
 function stop() {
@@ -969,6 +977,7 @@ function update() {
   $('seek').disabled = mode !== 'file';
   window.__dbg = {
     gl, Bloom, prog, vbo, A,
+    version: VERSION, date: DATE,
     get vertexCount() { return vertCount; },
     ext: gl.getExtension('EXT_disjoint_timer_query_webgl2')
   };
@@ -983,9 +992,14 @@ async function start() {
     if (attempt !== session) return;
 
     if (mode === 'mic') {
+      const id = ++session;
+      loading = true;
       $('message').textContent = '等待麦克风授权…';
       const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (attempt !== session) { s.getTracks().forEach(t => t.stop()); return; }
+      if (id !== session) {
+        s.getTracks().forEach(t => t.stop());
+        return;
+      }
       stream = s;
       source = ctx.createMediaStreamSource(s);
       source.connect(analyser);
@@ -1036,13 +1050,12 @@ async function start() {
     playing = true;
     update();
   } catch (e) {
-    if (attempt !== session) return;
     stop();
     $('message').textContent = mode === 'mic'
       ? '无法访问麦克风，请检查浏览器权限，或导入音频。'
       : '无法播放此音频，请尝试其他文件。';
   } finally {
-    if (attempt === session) loading = false;
+    if (attempt === session || !playing) loading = false;
   }
 }
 
@@ -1111,11 +1124,9 @@ $('file').onchange = async e => {
     loading = false;
     await start();
   } catch (err) {
-    if (id !== session) return;
-    stop();
     $('message').textContent = '无法读取该文件，请尝试 MP3 或 WAV 音频。';
   } finally {
-    if (id === session) loading = false;
+    loading = false; // 最初就是直接置 false
   }
 };
 
@@ -1149,7 +1160,7 @@ document.addEventListener('keydown', e => {
 });
 
 $('seek').onkeydown = e => {
-  if (mode !== 'file' || !buffer) {seeking = false;return};
+  if (mode !== 'file' || !buffer) return;
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
   e.preventDefault();
   const STEP = 5;
@@ -1162,7 +1173,7 @@ $('seek').onkeydown = e => {
 };
 
 $('seek').oninput = () => {
-  if (mode !== 'file' || !buffer) {seeking = false;return};
+  if (mode !== 'file' || !buffer) return;
   seeking = true;
   $('elapsed').textContent = format(+$('seek').value / 100 * buffer.duration);
 };
@@ -1254,6 +1265,7 @@ requestAnimationFrame(frame);
 
 $('ssaa').textContent = Bloom.ssaa + 'x';
 $('bloomLevels').textContent = Bloom.levels + 'x';
+$('version').textContent = 'v' + VERSION + ' ' + DATE;
 update();
 
 /* 控制台里的GPU帧时间
