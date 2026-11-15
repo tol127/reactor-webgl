@@ -14,7 +14,7 @@ const sg = spec.getContext('2d');
 let ctx, analyser, bins, wave, master, stream, source, buffer;
 let started = 0, offset = 0, mode = 'demo', playing = false, loading = false;
 let session = 0, rafTime = 0;
-let angle = -0.32, tilt = 0.58, zoom = 1, drag = null;
+let angle = -0.4, tilt = 0.6, zoom = 1.05, drag = null;
 let demoNodes = [];
 let gain = 1.4, smoothing = 0.75, energy = 0;
 let smoothPeakIndex = 0, smoothfundPeakIndex = 0, smooth = 0.8;
@@ -25,22 +25,25 @@ let playStartOffset = 0;
 let LOOP = true;
 let sortedRods = null;   // 缓存的深度排序结果
 let lastSortedAngle = NaN;
-const MAX_VERTS    = 262144;   // 极限约102096
+
+const MAX_VERTS    = 130172 * 4;   // 极限约125000 * (SCALE ^ 2)
 const FFTSize = 2048;
 const FBO_Bloom = 1;
 const FBO_SS = 2;
 const EAT_BLOOM = false;
+const SCALE = 1.0
 
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.6.2';
+const VERSION = '1.7.0';
 const DATE = '2026-11-15';
 
 /*
-更新内容：
-1.版本号
-2.再次撤销优化
+主要更新内容：
+1.project()重写
+2.tilt范围扩大
+3.全局缩放因子 scale
 */
 
 
@@ -48,10 +51,10 @@ const DATE = '2026-11-15';
  *  控制棒数据
  * ============================================================ */
 const rods = [];
-for (let x = -15; x <= 15; x++)
-  for (let z = -15; z <= 15; z++) {
+for (let x = -15 * SCALE; x <= 15 * SCALE; x++)
+  for (let z = -15 * SCALE; z <= 15 * SCALE; z++) {
     const r = Math.hypot(x, z);
-    if (r <= 15) rods.push({
+    if (r <= 15 * SCALE) rods.push({
       x, z, r,
       h: 0,
       seed: Math.abs(Math.sin(x * 127.1 + z * 311.7))
@@ -134,7 +137,7 @@ const Bloom = (function () {
   let progCompositeSingle = null;
   let quadBuf = null;
 
-  // ---- uniform location 缓存（修复项 6）----
+  // ---- uniform location 缓存----
   let U = null;
 
   let threshold = 0.25;
@@ -327,7 +330,7 @@ const Bloom = (function () {
     progCompositeMulti = link(VS_QUAD, FS_COMPOSITE_MULTI);
     progCompositeSingle = link(VS_QUAD, FS_COMPOSITE_SINGLE);
 
-    // ---- 一次性缓存所有 uniform location（修复项 6）----
+    // ---- 一次性缓存所有 uniform location----
     U = {
       bright: {
         uScene: gl.getUniformLocation(progBright, 'uScene'),
@@ -524,7 +527,7 @@ function setWriteTarget(buf, maxFloats) {
 }
 
 /* ============================================================
- *  等距投影（修复项：scale 缓存）
+ *  等距投影 + scale 缓存
  * ============================================================ */
 let canvasW = 1, canvasH = 1;
 let projScale = 1;       // 每帧或相机变化时算一次
@@ -537,16 +540,28 @@ function updateCameraCache() {
 }
 
 function project(x, z, h) {
+  // 1. 绕 Y 轴旋转 (水平旋转)
   const rx = x * camCos.v - z * camSin.v;
   const rz = x * camSin.v + z * camCos.v;
+
+  // 2. 绕 X 轴旋转 (垂直俯仰)
+  // 当 tilt = 0 时，从正侧面看，圆盘变一条线，柱子最高
+  // 当 tilt = PI/2 (1.57) 时，从正上方看，圆盘正圆，柱子看不见
+  const cosP = Math.cos(tilt);
+  const sinP = Math.sin(tilt);
+
+  // 在等距投影中，Y 轴包含“深度压低”和“高度”两个分量
+  const screenX = rx * projScale;
+  const screenY = (rz * sinP - h * cosP) * projScale;
+
   return [
-    canvasW / 2 + rx * projScale,
-    canvasH * 0.55 + rz * projScale * tilt - h * projScale
+    canvasW / 2 + screenX,
+    canvasH * 0.55 + screenY
   ];
 }
 
 /* ============================================================
- *  颜色工具（修复项 10：启用 hexCache）
+ *  颜色工具
  * ============================================================ */
 const hexCache = new Map();
 function rgb(r, g, b) {
@@ -574,7 +589,7 @@ const COL_HEX = {
   sideEdge:      '#111910',
   topEdge:       '#232d20',
   rodDot:        '#404735',
-  edge:          '#0d1409'   // ← 修复项 1
+  edge:          '#0d1409'
 };
 
 const COL = Object.fromEntries(
@@ -682,16 +697,16 @@ function buildGeometry() {
     }
   }
 
-  drawRing(16.4, '#060b07', 20);
-  drawRing(16.5, '#505948',  2);
-  drawRing(16.0, '#878969',  1);
-  drawRing(17.3, '#303a2d',  1);
+  drawRing(16.4 * SCALE, '#060b07', 20);
+  drawRing(16.5 * SCALE, '#505948',  2);
+  drawRing(16.0 * SCALE, '#878969',  1);
+  drawRing(17.3 * SCALE, '#303a2d',  1);
 
   // 2. 80 刻度块
   for (let i = 0; i < 80; i++) {
     const a = i / 80 * Math.PI * 2;
     const a2 = a + 0.034;
-    const r0 = 15.7, r1 = 16.15;
+    const r0 = 15.7 * SCALE, r1 = 16.15 * SCALE;
     const p1 = project(Math.cos(a) * r0, Math.sin(a) * r0, 0);
     const p2 = project(Math.cos(a2) * r0, Math.sin(a2) * r0, 0);
     const p3 = project(Math.cos(a2) * r1, Math.sin(a2) * r1, 0);
@@ -757,7 +772,7 @@ function buildGeometry() {
     if (f3 || f4) pushEdge(d, d0, COL.edge, edgeWidth);
 
     const dotPos = project(x, z, h + 0.01);
-    pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * tilt, COL.rodDot, 32);
+    pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * Math.sin(tilt), COL.rodDot, 32);
   }
 
   vertCount = vp / 6;
@@ -823,8 +838,6 @@ function frame(t) {
     smoothPeakIndex = smoothPeakIndex * smooth + fundIndex * (1.0 - smooth);
 
     // 峰值频率（300Hz 以上找最大值）
-    const sampleRate = ctx ? ctx.sampleRate : 44100;
-    const binHz = sampleRate / FFTSize;
     const startHigh = Math.floor(300 / binHz);
     for (let i = startHigh; i < bins.length - 2; i++) {
       if (bins[i] > peak) { peak = bins[i]; peakIndex = i; }
@@ -840,8 +853,8 @@ function frame(t) {
   }
 
   // ---- Bloom 动态参数 ----
-  const bloomIntensity = Math.min(3.00, 1.35 + energy * 0.75);
-  const bloomThreshold = Math.max(0.15, 0.40 - energy * 0.25);
+  const bloomIntensity = Math.min(1.85, 1.25 + energy * 0.65);
+  const bloomThreshold = Math.max(0.35, 0.45 - energy * 0.15);
   Bloom.setParams({
     intensity: bloomIntensity,
     threshold: bloomThreshold,
@@ -854,7 +867,7 @@ function frame(t) {
     const rod = rods[i];
     let amp = 0;
     if (playing && bins) {
-      const hz = 45 * Math.pow(320, rod.r / 15);
+      const hz = 45 * Math.pow(320, rod.r / 15 / SCALE);
       const idx = Math.max(1, Math.min(bins.length - 2, Math.round(hz / binHz)));
       amp = (bins[idx] + bins[idx - 1] + bins[idx + 1]) / 765;
       amp = Math.pow(amp, 1.7) * gain;
@@ -1104,10 +1117,16 @@ $('upload').onclick = () => $('file').click();
 $('file').onchange = async e => {
   const f = e.target.files[0];
   if (!f) return;
+  
+  // 拦截 MKV
+  if (f.name.toLowerCase().endsWith('.mkv')) {
+    console.warn("对 MKV 格式的支持不佳。建议使用 MP3 / MPA / M4A / FLAC 等格式。");
+  }
   stop();
   const id = session;
   loading = true;
   $('message').textContent = '正在读取音频…';
+  
   try {
     await audio();
     if (id !== session) return;
@@ -1224,7 +1243,7 @@ canvas.addEventListener('pointermove', e => {
   // 前半区：向右拖 → 角度减小；后半区：向右拖 → 角度增大（方向相反）
   angle += (isFront ? -1 : 1) * dx * 0.006;
 
-  tilt = Math.max(0.3, Math.min(0.8, tilt + (e.clientY - drag.y) * 0.005));
+  tilt = Math.max(0.4, Math.min(1.0, tilt + (e.clientY - drag.y) * 0.005));
   drag = { x: e.clientX, y: e.clientY };
 });
 
@@ -1237,9 +1256,9 @@ canvas.addEventListener('wheel', e => {
 }, { passive: false });
 
 $('reset').onclick = () => {
-  angle = -0.32;
-  tilt = 0.58;
-  zoom = 1;
+  angle = -0.4;
+  tilt = 0.6;
+  zoom = 1.05;
 };
 
 $('fullscreen').onclick = async () => {
@@ -1266,8 +1285,9 @@ requestAnimationFrame(frame);
 $('ssaa').textContent = Bloom.ssaa + 'x';
 $('bloomLevels').textContent = Bloom.levels + 'x';
 $('version').textContent = 'v' + VERSION + ' ' + DATE;
+$('scale').textContent = SCALE + 'x'
 update();
 
-/* 控制台里的GPU帧时间
+/*
 (() => {const { gl, Bloom, prog, vbo, A, ext } = window.__dbg;if (!ext) { console.warn('EXT_disjoint_timer_query_webgl2 不可用'); return; }const vertexCount = window.__dbg.vertexCount;if (!vertexCount) { console.warn('vertexCount 为 0，可能还没渲染过'); return; }const query = gl.createQuery();gl.beginQuery(ext.TIME_ELAPSED_EXT, query);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.disable(gl.DEPTH_TEST);Bloom.beginScene();gl.useProgram(prog);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.enableVertexAttribArray(A.pos);gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);gl.enableVertexAttribArray(A.color);gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);gl.drawArrays(gl.TRIANGLES, 0, vertexCount);Bloom.endScene();gl.endQuery(ext.TIME_ELAPSED_EXT);function poll() {const available = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);if (disjoint) { console.warn('GPU disjoint，丢弃'); gl.deleteQuery(query); return; }if (available) {const ms = gl.getQueryParameter(query, gl.QUERY_RESULT) / 1e6;const maxfps = 1000/ms;console.log('GPU 帧时间 (ms):', ms.toFixed(3));console.log('理论最大帧率 :', maxfps.toFixed(3));gl.deleteQuery(query);} else {requestAnimationFrame(poll);}}requestAnimationFrame(poll);})();
 */
