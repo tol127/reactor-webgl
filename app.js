@@ -25,30 +25,28 @@ let playStartOffset = 0;
 let LOOP = true;
 let sortedRods = null;   // 缓存的深度排序结果
 let lastSortedAngle = NaN;
-
-const FFTSize = 2048;
+let MAXHZ = 16000;
+let MAX_VERTS = 100000;
 const FBO_Bloom = 1;
 const FBO_SS = 2;
 const EAT_BLOOM = false;
+const Cherenkov_BLOOM = false;
 const SCALE = 1;
-const MAXHZ = 16500; //视频网站常见16khz截断，不建议超过 采样率/2（通常为44.1Khz / 2 = 22050Hz）
-let MAX_VERTS = 125000 * SCALE * SCALE;
-
-//顶点补充：
-//若MAX_VERTS    再次 x2，SCALE < 0.15 时顶点越界（现状）
-//若MAX_VERTS 不 再次 x2，SCALE < 0.66 时顶点越界
 
 zoom /= SCALE;
 
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.1';
-const DATE = '2026-11-15';
+const VERSION = '1.7.3';
+const DATE = '2026-11-17';
 
 /*
 主要更新内容：
-1.频率上限MAXHZ
+1.减少数组使用
+2.降低圆点段数
+3.切伦科夫辐射（BloomEXT）
+4.其他
 */
 
 
@@ -234,6 +232,7 @@ const Bloom = (function () {
     void main(){
       vec4 scene = texture(uScene, vUV);
       vec3 bloom = texture(uBloom, vUV).rgb;
+      ${Cherenkov_BLOOM ? 'bloom *= vec3(0.45, 1.2, 1.5)' : ''}; 
       ${EAT_BLOOM ? 'bloom *= scene.a;' : ''}
       vec3 color = scene.rgb + bloom * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
@@ -521,6 +520,8 @@ let vertCount = 0;
 let vertNeeded = 0;
 
 const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, vertData.byteLength, gl.DYNAMIC_DRAW);
 
 let writeBuf = null;
 let writeMax = 0;
@@ -538,11 +539,14 @@ function setWriteTarget(buf, maxFloats) {
 let canvasW = 1, canvasH = 1;
 let projScale = 1;       // 每帧或相机变化时算一次
 const camSin = { v: 0 }, camCos = { v: 1 };
+const camSinTilt = { v: 0 }, camCosTilt = { v: 1 };
 
 function updateCameraCache() {
   projScale = Math.min(canvasW / 45, canvasH / 37) * zoom;
   camSin.v = Math.sin(angle);
   camCos.v = Math.cos(angle);
+  camSinTilt.v = Math.sin(tilt);
+  camCosTilt.v = Math.cos(tilt);
 }
 
 function project(x, z, h) {
@@ -553,12 +557,11 @@ function project(x, z, h) {
   // 2. 绕 X 轴旋转 (垂直俯仰)
   // 当 tilt = 0 时，从正侧面看，圆盘变一条线，柱子最高
   // 当 tilt = PI/2 (1.57) 时，从正上方看，圆盘正圆，柱子看不见
-  const cosP = Math.cos(tilt);
-  const sinP = Math.sin(tilt);
+  // 见camSinTilt/camCosTilt
 
   // 在等距投影中，Y 轴包含“深度压低”和“高度”两个分量
   const screenX = rx * projScale;
-  const screenY = (rz * sinP - h * cosP) * projScale;
+  const screenY = (rz * camSinTilt.v - h * camCosTilt.v) * projScale;
 
   return [
     canvasW / 2 + screenX,
@@ -628,17 +631,17 @@ function pushEdge(p1, p2, color, edgeWidth) {
   const nX = -dy / len * edgeWidth * 0.5;
   const nY =  dx / len * edgeWidth * 0.5;
 
-  const A0 = [p1[0] + nX, p1[1] + nY];
-  const B0 = [p2[0] + nX, p2[1] + nY];
-  const C0 = [p2[0] - nX, p2[1] - nY];
-  const D0 = [p1[0] - nX, p1[1] - nY];
+  const AX = p1[0] + nX, AY = p1[1] + nY;
+  const BX = p2[0] + nX, BY = p2[1] + nY;
+  const CX = p2[0] - nX, CY = p2[1] - nY;
+  const DX = p1[0] - nX, DY = p1[1] - nY;
 
-  pushVertex(A0[0], A0[1], color);
-  pushVertex(B0[0], B0[1], color);
-  pushVertex(C0[0], C0[1], color);
-  pushVertex(A0[0], A0[1], color);
-  pushVertex(C0[0], C0[1], color);
-  pushVertex(D0[0], D0[1], color);
+  pushVertex(AX, AY, color);
+  pushVertex(BX, BY, color);
+  pushVertex(CX, CY, color);
+  pushVertex(AX, AY, color);
+  pushVertex(CX, CY, color);
+  pushVertex(DX, DY, color);
 }
 
 function pushQuad(p1, p2, p3, p4, col) {
@@ -772,19 +775,22 @@ function buildGeometry() {
     if (f3 || f4) pushEdge(d, d0, COL.edge, edgeWidth);
 
     const dotPos = project(x, z, h + 0.01);
-    pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * Math.sin(tilt), COL.rodDot, 32);
+    pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * camSinTilt.v, COL.rodDot, 12);
   }
 
   vertCount = vp / 6;
 
   gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-  gl.bufferData(gl.ARRAY_BUFFER, vertData.subarray(0, vp), gl.DYNAMIC_DRAW);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, vertData, 0, vp);
   
   if (vertNeeded > writeMax / 6 && !vertOverflowWarned) {
     vertOverflowWarned = true;
-    console.warn(
-      'vertex buffer overflow: ' + vertNeeded + '/' + (writeMax / 6)
-    );
+    console.warn('vertex buffer overflow: ' + vertNeeded + '/' + (writeMax / 6));
+    $('message').innerHTML =
+      '<span style="color:#ff5a76">你看你乱调参数把顶点搞爆了吧，画面是不是缺一块？<br>' +
+      '需要 ' + vertNeeded + ' 顶点，你只给 ' + (writeMax / 6) + ' 顶点。<br>' +
+      '只画了' + (100 / (vertNeeded / (writeMax / 6))).toFixed(2) + '%。' + 
+      '</span>';
   }
 }
 
@@ -835,7 +841,7 @@ function frame(t) {
   let peak = 0, peakIndex = 0;
   let fundPeak = 0, fundIndex = 0;
   const sampleRate = ctx ? ctx.sampleRate : 44100;
-  const binHz = sampleRate / FFTSize;
+  const binHz = sampleRate / 2048;
 
   if (playing && bins) {
     // 基础频率
@@ -922,7 +928,6 @@ function frame(t) {
 
   // ---- 读数 ----
   if (t % 100 < 25) {
-    //屎山勿动
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
     $('fund').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
     $('freq').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
@@ -954,7 +959,7 @@ async function audio() {
   if (!ctx) {
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = ctx.createAnalyser();
-    analyser.fftSize = FFTSize;
+    analyser.fftSize = 2048;
     analyser.smoothingTimeConstant = 0.75;
     bins = new Uint8Array(analyser.frequencyBinCount);
     wave = new Float32Array(analyser.fftSize);
