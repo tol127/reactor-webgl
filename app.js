@@ -24,9 +24,11 @@ let playStartCtxTime = 0;
 let playStartOffset = 0;
 let sortedRods = null;
 let lastSortedAngle = NaN;
+
 let MAX_HZ = 16000;
-let NO_DOT = false;
 let DOT_SEG = 8;
+let NO_DOT = false;
+let NO_EDGE = false;
 let LOOP = true;
 const MAX_VERTS = 100000;
 const FBO_SS = 2;
@@ -34,6 +36,7 @@ const FBO_Bloom = 1;
 const BLUR_PASSES = 8;
 const EAT_BLOOM = false;
 const BLOOM_TINT = false ,TINT_COLOR = [0.25, 0.75, 1.85];
+const EDGE_WIDTH_PX = 1;
 const SCALE = 1;
 
 zoom /= SCALE;
@@ -41,7 +44,7 @@ zoom /= SCALE;
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.5';
+const VERSION = '1.7.6';
 const DATE = '2026-11-18';
 
 /* ============================================================
@@ -709,7 +712,7 @@ function buildGeometry() {
   const sinA = camSin.v, cosA = camCos.v;
   const sa = sinA, ca = cosA;
   const dotSize = projScale * 0.12;
-  const edgeWidth = Math.max(0.8 * zoom, 1);
+  const edgeWidth = EDGE_WIDTH_PX * zoom * (canvas.width / canvasW);
   const sorted = sortedRods;
 
   for (let s = 0; s < sorted.length; s++) {
@@ -742,24 +745,26 @@ function buildGeometry() {
       top[1] + amp * 40,
       top[2] + amp * 24
     ));
+    
+    if (!NO_EDGE){
+      pushEdge(a, b, COL.edge, edgeWidth);
+      pushEdge(b, c, COL.edge, edgeWidth);
+      pushEdge(c, d, COL.edge, edgeWidth);
+      pushEdge(d, a, COL.edge, edgeWidth);
 
-    pushEdge(a, b, COL.edge, edgeWidth);
-    pushEdge(b, c, COL.edge, edgeWidth);
-    pushEdge(c, d, COL.edge, edgeWidth);
-    pushEdge(d, a, COL.edge, edgeWidth);
+      const depthA = -sa - ca, depthB = sa - ca, depthC = sa + ca, depthD = -sa + ca;
+      const dAB = depthA + depthB, dCD = depthC + depthD;
+      const dBC = depthB + depthC, dDA = depthD + depthA;
+      const f1 = dAB > dCD;
+      const f2 = dBC > dDA;
+      const f3 = dCD > dAB;
+      const f4 = dDA > dBC;
 
-    const depthA = -sa - ca, depthB = sa - ca, depthC = sa + ca, depthD = -sa + ca;
-    const dAB = depthA + depthB, dCD = depthC + depthD;
-    const dBC = depthB + depthC, dDA = depthD + depthA;
-    const f1 = dAB > dCD;
-    const f2 = dBC > dDA;
-    const f3 = dCD > dAB;
-    const f4 = dDA > dBC;
-
-    if (f1 || f4) pushEdge(a, a0, COL.edge, edgeWidth);
-    if (f1 || f2) pushEdge(b, b0, COL.edge, edgeWidth);
-    if (f2 || f3) pushEdge(c, c0, COL.edge, edgeWidth);
-    if (f3 || f4) pushEdge(d, d0, COL.edge, edgeWidth);
+      if (f1 || f4) pushEdge(a, a0, COL.edge, edgeWidth);
+      if (f1 || f2) pushEdge(b, b0, COL.edge, edgeWidth);
+      if (f2 || f3) pushEdge(c, c0, COL.edge, edgeWidth);
+      if (f3 || f4) pushEdge(d, d0, COL.edge, edgeWidth);
+    }
 
     const dotPos = project(x, z, h + 0.01);
     if (!NO_DOT){
@@ -1288,11 +1293,5 @@ $('ssaa').textContent = Bloom.ssaa + 'x';
 $('bloomLevels').textContent = Bloom.levels + 'x';
 $('version').textContent = 'v' + VERSION + ' ' + DATE;
 $('scale').textContent = SCALE + 'x'
-
-/* SCALE > 1 时 gain 滑块上限提高到 5 */
-if (SCALE > 1) {
-  const gs = $('gain');
-  gs.max = gs.dataset.maxScaled || 5;
-}
 
 update();
