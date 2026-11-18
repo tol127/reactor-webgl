@@ -6,11 +6,9 @@
 
 ## 本地运行
 
-```bash
-python3 -m http.server 4173 --directory dist
 ```
-
-Then open <http://localhost:4173>.
+别想了，没有。
+```
 
 ## 注意事项
 
