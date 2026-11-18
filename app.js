@@ -17,7 +17,7 @@ let session = 0, rafTime = 0;
 let angle = -0.4, tilt = 0.6, zoom = 1.15, drag = null;
 let demoNodes = [];
 let gain = 1.4, smoothing = 0.75, energy = 0;
-let smoothPeakIndex = 0, smoothfundPeakIndex = 0, smooth = 0.8;
+let smoothFundIndex = 0, smoothPeakIndex = 0, smooth = 0.8;
 let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
 let playStartCtxTime = 0;
@@ -28,12 +28,12 @@ let MAX_HZ = 16000;
 let NO_DOT = false;
 let DOT_SEG = 8;
 let LOOP = true;
-const MAX_VERTS = 500000;
+const MAX_VERTS = 100000;
+const FBO_SS = 2;
 const FBO_Bloom = 1;
 const BLUR_PASSES = 8;
-const FBO_SS = 2;
 const EAT_BLOOM = false;
-const Cherenkov_BLOOM = false;
+const BLOOM_TINT = false ,TINT_COLOR = [0.25, 0.75, 1.85];
 const SCALE = 1;
 
 zoom /= SCALE;
@@ -41,15 +41,8 @@ zoom /= SCALE;
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.4';
+const VERSION = '1.7.5';
 const DATE = '2026-11-18';
-
-/*
-主要更新内容：
-1.一些不可见的选项
-2.SCALE也改变控制棒高度
-*/
-
 
 /* ============================================================
  *  控制棒数据
@@ -121,7 +114,7 @@ const A = {
 
 
 /* ============================================================
- *  Bloom 后处理模块（仅 SSAA）
+ *  Bloom 后处理模块
  * ============================================================ */
 const Bloom = (function () {
 
@@ -199,6 +192,7 @@ const Bloom = (function () {
       fragColor = vec4(result, 1.0);
     }`;
 
+  const CB_TINT = 'vec3(' + TINT_COLOR.join(', ') + ')';
   const FS_COMPOSITE_MULTI = `#version 300 es
     precision mediump float;
     in vec2 vUV;
@@ -216,7 +210,7 @@ const Bloom = (function () {
              + texture(uBloom1, vUV).rgb * uW1
              + texture(uBloom2, vUV).rgb * uW2
              + texture(uBloom3, vUV).rgb * uW3;
-      ${Cherenkov_BLOOM ? 'b *= vec3(0.45, 1.2, 1.5)' : ''}; 
+      ${BLOOM_TINT ? 'b *= ' + CB_TINT : ''}; 
       ${EAT_BLOOM ? 'b *= scene.a;' : ''}
       vec3 color = scene.rgb + b * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
@@ -234,7 +228,7 @@ const Bloom = (function () {
     void main(){
       vec4 scene = texture(uScene, vUV);
       vec3 bloom = texture(uBloom, vUV).rgb;
-      ${Cherenkov_BLOOM ? 'bloom *= vec3(0.45, 1.2, 1.5)' : ''}; 
+      ${BLOOM_TINT ? 'bloom *= ' + CB_TINT : ''}; 
       ${EAT_BLOOM ? 'bloom *= scene.a;' : ''}
       vec3 color = scene.rgb + bloom * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
@@ -843,14 +837,14 @@ function frame(t) {
     for (let i = 2; i < bins.length - 2; i++) {
       if (bins[i] > fundPeak) { fundPeak = bins[i]; fundIndex = i; }
     }
-    smoothPeakIndex = smoothPeakIndex * smooth + fundIndex * (1.0 - smooth);
+    smoothFundIndex = smoothFundIndex * smooth + fundIndex * (1.0 - smooth);
 
     // 峰值频率（300Hz 以上找最大值）
     const startHigh = Math.floor(300 / binHz);
     for (let i = startHigh; i < bins.length - 2; i++) {
       if (bins[i] > peak) { peak = bins[i]; peakIndex = i; }
     }
-    smoothfundPeakIndex = smoothfundPeakIndex * smooth + peakIndex * (1.0 - smooth);
+    smoothPeakIndex = smoothPeakIndex * smooth + peakIndex * (1.0 - smooth);
   }
 
   energy = 0;
@@ -924,8 +918,8 @@ function frame(t) {
   // ---- 读数 ----
   if (t % 100 < 25) {
     $('level').innerHTML = (playing ? Math.round(20 * Math.log10(Math.max(energy, 0.001))) : '—') + '<small>dB</small>';
-    $('fund').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
-    $('freq').innerHTML = (playing && peak > 0) ? Math.round(smoothfundPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    $('fund').innerHTML = (playing && fundPeak > 0) ? Math.round(smoothFundIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
+    $('freq').innerHTML = (playing && peak > 0) ? Math.round(smoothPeakIndex * binHz) + '<small>Hz</small>' : '—<small>Hz</small>';
 
     if (playing && !seeking) {
       let seconds;
@@ -1152,7 +1146,8 @@ $('file').onchange = async e => {
   } catch (err) {
     $('message').textContent = '无法读取该文件，请尝试 MP3 或 WAV 音频。';
   } finally {
-    loading = false; // 最初就是直接置 false
+    loading = false;
+    e.target.value = '';
   }
 };
 
@@ -1293,4 +1288,11 @@ $('ssaa').textContent = Bloom.ssaa + 'x';
 $('bloomLevels').textContent = Bloom.levels + 'x';
 $('version').textContent = 'v' + VERSION + ' ' + DATE;
 $('scale').textContent = SCALE + 'x'
+
+/* SCALE > 1 时 gain 滑块上限提高到 5 */
+if (SCALE > 1) {
+  const gs = $('gain');
+  gs.max = gs.dataset.maxScaled || 5;
+}
+
 update();
