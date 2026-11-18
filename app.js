@@ -9,12 +9,12 @@ const spec = $('spectrum');
 const sg = spec.getContext('2d');
 
 /* ============================================================
- *  提前定义的一些玩意
+ *  常量
  * ============================================================ */
 let ctx, analyser, bins, wave, master, stream, source, buffer;
 let started = 0, offset = 0, mode = 'demo', playing = false, loading = false;
 let session = 0, rafTime = 0;
-let angle = -0.4, tilt = 0.6, zoom = 1.05, drag = null;
+let angle = -0.4, tilt = 0.6, zoom = 1.15, drag = null;
 let demoNodes = [];
 let gain = 1.4, smoothing = 0.75, energy = 0;
 let smoothPeakIndex = 0, smoothfundPeakIndex = 0, smooth = 0.8;
@@ -22,12 +22,15 @@ let seeking = false;
 let fpsLast = 0, fpsFrames = 0;
 let playStartCtxTime = 0;
 let playStartOffset = 0;
-let LOOP = true;
-let sortedRods = null;   // 缓存的深度排序结果
+let sortedRods = null;
 let lastSortedAngle = NaN;
-let MAXHZ = 16000;
-let MAX_VERTS = 100000;
+let MAX_HZ = 16000;
+let NO_DOT = false;
+let DOT_SEG = 8;
+let LOOP = true;
+const MAX_VERTS = 500000;
 const FBO_Bloom = 1;
+const BLUR_PASSES = 8;
 const FBO_SS = 2;
 const EAT_BLOOM = false;
 const Cherenkov_BLOOM = false;
@@ -38,15 +41,13 @@ zoom /= SCALE;
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.3';
-const DATE = '2026-11-17';
+const VERSION = '1.7.4';
+const DATE = '2026-11-18';
 
 /*
 主要更新内容：
-1.减少数组使用
-2.降低圆点段数
-3.切伦科夫辐射（BloomEXT）
-4.其他
+1.一些不可见的选项
+2.SCALE也改变控制棒高度
 */
 
 
@@ -146,7 +147,7 @@ const Bloom = (function () {
   let threshold = 0.25;
   let intensity = 1.8;
   let radius = 2.5;
-  let singleRadius = 2.5;
+  let singleRadius = 3.5;
   let sceneHasAlpha = true;
 
   /* ---------- Shader ---------- */
@@ -215,7 +216,8 @@ const Bloom = (function () {
              + texture(uBloom1, vUV).rgb * uW1
              + texture(uBloom2, vUV).rgb * uW2
              + texture(uBloom3, vUV).rgb * uW3;
-      b *= scene.a;
+      ${Cherenkov_BLOOM ? 'b *= vec3(0.45, 1.2, 1.5)' : ''}; 
+      ${EAT_BLOOM ? 'b *= scene.a;' : ''}
       vec3 color = scene.rgb + b * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
       color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
@@ -469,7 +471,6 @@ const Bloom = (function () {
     gl.uniform1f(U.bright.uThreshold, threshold);
     drawQuad(progBright);
 
-    const BLUR_PASSES = 4;
     gl.useProgram(progBlur);
     for (let p = 0; p < BLUR_PASSES; p++) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboBlur.fbo);
@@ -550,16 +551,8 @@ function updateCameraCache() {
 }
 
 function project(x, z, h) {
-  // 1. 绕 Y 轴旋转 (水平旋转)
   const rx = x * camCos.v - z * camSin.v;
   const rz = x * camSin.v + z * camCos.v;
-
-  // 2. 绕 X 轴旋转 (垂直俯仰)
-  // 当 tilt = 0 时，从正侧面看，圆盘变一条线，柱子最高
-  // 当 tilt = PI/2 (1.57) 时，从正上方看，圆盘正圆，柱子看不见
-  // 见camSinTilt/camCosTilt
-
-  // 在等距投影中，Y 轴包含“深度压低”和“高度”两个分量
   const screenX = rx * projScale;
   const screenY = (rz * camSinTilt.v - h * camCosTilt.v) * projScale;
 
@@ -775,7 +768,9 @@ function buildGeometry() {
     if (f3 || f4) pushEdge(d, d0, COL.edge, edgeWidth);
 
     const dotPos = project(x, z, h + 0.01);
-    pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * camSinTilt.v, COL.rodDot, 12);
+    if (!NO_DOT){
+      pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * camSinTilt.v, COL.rodDot, DOT_SEG);
+    }
   }
 
   vertCount = vp / 6;
@@ -880,7 +875,7 @@ function frame(t) {
     const rod = rods[i];
     let amp = 0;
     if (playing && bins) {
-      const hz = 45 * Math.pow(MAXHZ / 45, rod.r / 15 / SCALE);
+      const hz = 45 * Math.pow(MAX_HZ / 45, rod.r / 15 / SCALE);
       const idx = Math.max(1, Math.min(bins.length - 2, Math.round(hz / binHz)));
       amp = (bins[idx] + bins[idx - 1] + bins[idx + 1]) / 765;
       amp = Math.pow(amp, 1.7) * gain;
@@ -889,7 +884,7 @@ function frame(t) {
     }
     rod._amp = amp;
     const target = 0.07 + amp * 4.8;
-    rod.h += (target - rod.h) * smoothFactor;
+    rod.h += (target * SCALE - rod.h) * smoothFactor;
   }
 
   buildGeometry();
@@ -1299,7 +1294,3 @@ $('bloomLevels').textContent = Bloom.levels + 'x';
 $('version').textContent = 'v' + VERSION + ' ' + DATE;
 $('scale').textContent = SCALE + 'x'
 update();
-
-/*
-(() => {const { gl, Bloom, prog, vbo, A, ext } = window.__dbg;if (!ext) { console.warn('EXT_disjoint_timer_query_webgl2 不可用'); return; }const vertexCount = window.__dbg.vertexCount;if (!vertexCount) { console.warn('vertexCount 为 0，可能还没渲染过'); return; }const query = gl.createQuery();gl.beginQuery(ext.TIME_ELAPSED_EXT, query);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.disable(gl.DEPTH_TEST);Bloom.beginScene();gl.useProgram(prog);gl.bindBuffer(gl.ARRAY_BUFFER, vbo);gl.enableVertexAttribArray(A.pos);gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 24, 0);gl.enableVertexAttribArray(A.color);gl.vertexAttribPointer(A.color, 3, gl.FLOAT, false, 24, 12);gl.drawArrays(gl.TRIANGLES, 0, vertexCount);Bloom.endScene();gl.endQuery(ext.TIME_ELAPSED_EXT);function poll() {const available = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);if (disjoint) { console.warn('GPU disjoint，丢弃'); gl.deleteQuery(query); return; }if (available) {const ms = gl.getQueryParameter(query, gl.QUERY_RESULT) / 1e6;const maxfps = 1000/ms;console.log('GPU 帧时间 (ms):', ms.toFixed(3));console.log('理论最大帧率 :', maxfps.toFixed(3));gl.deleteQuery(query);} else {requestAnimationFrame(poll);}}requestAnimationFrame(poll);})();
-*/
