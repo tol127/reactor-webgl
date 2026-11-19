@@ -27,25 +27,27 @@ let lastSortedAngle = NaN;
 
 let MAX_HZ = 16000;
 let DOT_SEG = 8;
-let NO_DOT = false;
-let NO_EDGE = false;
+let RING_STEP = 64;
+let DRAW_DOT = true; //绘制点
+let DRAW_EDGE = true; //绘制棱(边)
+let DRAW_SIDE = [1,1,1,1,1]; //绘制面 可以改为[0,0,1,1,1]，且画面差异较小
 let LOOP = true;
-const MAX_VERTS = 100000;
-const FBO_SS = 2;
-const FBO_Bloom = 1;
-const BLUR_PASSES = 8;
-const EAT_BLOOM = false;
-const BLOOM_TINT = false ,TINT_COLOR = [0.25, 0.75, 1.85];
-const EDGE_WIDTH_PX = 1;
-const SCALE = 1;
+let MAX_VERTS = 100000;
+let FBO_SS = 2; //SCALE调大时可以适当减少
+let FBO_Bloom = 1; //SCALE调大时可以适当增加
+let FBO_BLUR_PASSES = 8;
+let FULL_BLOOM = true;
+let BLOOM_TINT = false ,TINT_COLOR = [0.25, 0.75, 1.85]; //Bloom染色
+let EDGE_WIDTH = 1;  //px
+let SCALE = 1;
 
 zoom /= SCALE;
 
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.6';
-const DATE = '2026-11-18';
+const VERSION = '1.7.7';
+const DATE = '2026-11-19';
 
 /* ============================================================
  *  控制棒数据
@@ -214,7 +216,7 @@ const Bloom = (function () {
              + texture(uBloom2, vUV).rgb * uW2
              + texture(uBloom3, vUV).rgb * uW3;
       ${BLOOM_TINT ? 'b *= ' + CB_TINT : ''}; 
-      ${EAT_BLOOM ? 'b *= scene.a;' : ''}
+      ${FULL_BLOOM ? '' : 'b *= scene.a;'};
       vec3 color = scene.rgb + b * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
       color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
@@ -232,7 +234,7 @@ const Bloom = (function () {
       vec4 scene = texture(uScene, vUV);
       vec3 bloom = texture(uBloom, vUV).rgb;
       ${BLOOM_TINT ? 'bloom *= ' + CB_TINT : ''}; 
-      ${EAT_BLOOM ? 'bloom *= scene.a;' : ''}
+      ${FULL_BLOOM ? '' : 'b *= scene.a;'};
       vec3 color = scene.rgb + bloom * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
       color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
@@ -469,7 +471,7 @@ const Bloom = (function () {
     drawQuad(progBright);
 
     gl.useProgram(progBlur);
-    for (let p = 0; p < BLUR_PASSES; p++) {
+    for (let p = 0; p < FBO_BLUR_PASSES; p++) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboBlur.fbo);
       gl.viewport(0, 0, bw, bh);
       bindTexture(fboBright.tex, 0);
@@ -671,10 +673,9 @@ function buildGeometry() {
   }
 
   // 1. 外圈环
-  function drawRing(radius, colorHex, widthPx) {
+  function drawRing(radius, colorHex, widthPx, step) {
     const ringColor = hex2rgb(colorHex);
     const halfWidth = (widthPx * 0.5) / projScale;
-    const step = 96;
     for (let i = 0; i < step; i++) {
       const a0 = i / step * Math.PI * 2;
       const a1 = (i + 1) / step * Math.PI * 2;
@@ -690,10 +691,10 @@ function buildGeometry() {
     }
   }
 
-  drawRing(16.4 * SCALE, '#060b07', 20);
-  drawRing(16.5 * SCALE, '#505948',  2);
-  drawRing(16.0 * SCALE, '#878969',  1);
-  drawRing(17.3 * SCALE, '#303a2d',  1);
+  drawRing(16.4 * SCALE, '#060b07', 20, RING_STEP);
+  drawRing(16.5 * SCALE, '#505948',  2, RING_STEP);
+  drawRing(16.0 * SCALE, '#878969',  1, RING_STEP);
+  drawRing(17.3 * SCALE, '#303a2d',  1, RING_STEP);
 
   // 2. 80 刻度块
   for (let i = 0; i < 80; i++) {
@@ -712,7 +713,7 @@ function buildGeometry() {
   const sinA = camSin.v, cosA = camCos.v;
   const sa = sinA, ca = cosA;
   const dotSize = projScale * 0.12;
-  const edgeWidth = EDGE_WIDTH_PX * zoom * (canvas.width / canvasW);
+  const edgeWidth = EDGE_WIDTH * zoom * (canvas.width / canvasW);
   const sorted = sortedRods;
 
   for (let s = 0; s < sorted.length; s++) {
@@ -731,22 +732,24 @@ function buildGeometry() {
     const c = project(x + half, z + half, h);
     const d = project(x - half, z + half, h);
 
-    pushQuad(a, b, b0, a0, COL.side1);
-    pushQuad(b, c, c0, b0, rgb(55 + amp * 30, 62 + amp * 30, 44 + amp * 20));
-    pushQuad(c, d, d0, c0, COL.side3);
-    pushQuad(d, a, a0, d0, COL.side4);
+    if (DRAW_SIDE[0] == true) pushQuad(a, b, b0, a0, COL.side1);
+    if (DRAW_SIDE[1] == true) pushQuad(b, c, c0, b0, rgb(55 + amp * 30, 62 + amp * 30, 44 + amp * 20));
+    if (DRAW_SIDE[2] == true) pushQuad(c, d, d0, c0, COL.side3);
+    if (DRAW_SIDE[3] == true) pushQuad(d, a, a0, d0, COL.side4);
 
     const seed = rod.seed;
     const top = seed > 0.92 ? [143, 109, 81]
               : seed > 0.85 ? [97, 118, 104]
               : [139 + seed * 29, 148 + seed * 22, 119 + seed * 21];
-    pushQuad(a, b, c, d, rgb(
-      top[0] + amp * 43,
-      top[1] + amp * 40,
-      top[2] + amp * 24
-    ));
+    if (DRAW_SIDE[4] == true){
+      pushQuad(a, b, c, d, rgb(
+        top[0] + amp * 43,
+        top[1] + amp * 40,
+        top[2] + amp * 24
+      ));
+    };
     
-    if (!NO_EDGE){
+    if (DRAW_EDGE){
       pushEdge(a, b, COL.edge, edgeWidth);
       pushEdge(b, c, COL.edge, edgeWidth);
       pushEdge(c, d, COL.edge, edgeWidth);
@@ -767,7 +770,7 @@ function buildGeometry() {
     }
 
     const dotPos = project(x, z, h + 0.01);
-    if (!NO_DOT){
+    if (DRAW_DOT){
       pushDisc(dotPos[0], dotPos[1], dotSize, dotSize * camSinTilt.v, COL.rodDot, DOT_SEG);
     }
   }
@@ -1259,7 +1262,7 @@ canvas.addEventListener('pointercancel', () => drag = null);
 
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
-  zoom = Math.max(0.5 / (SCALE), Math.min(2.2, zoom - e.deltaY * 0.001));
+  zoom = Math.max(0.5 / (SCALE), Math.min(2.2, zoom - e.deltaY * 0.001 / SCALE));
 }, { passive: false });
 
 $('reset').onclick = () => {
