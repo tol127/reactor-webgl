@@ -1298,3 +1298,8 @@ $('version').textContent = 'v' + VERSION + ' ' + DATE;
 $('scale').textContent = SCALE + 'x'
 
 update();
+
+/*
+api key:
+sk-kSOhklp8b45UNDqux5l1REaACn8djTOR
+*/
