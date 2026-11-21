@@ -46,8 +46,8 @@ zoom /= SCALE;
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.7';
-const DATE = '2026-11-19';
+const VERSION = '1.7.8';
+const DATE = '2026-11-21';
 
 /* ============================================================
  *  控制棒数据
@@ -713,7 +713,7 @@ function buildGeometry() {
   const sinA = camSin.v, cosA = camCos.v;
   const sa = sinA, ca = cosA;
   const dotSize = projScale * 0.12;
-  const edgeWidth = EDGE_WIDTH * zoom * (canvas.width / canvasW);
+  const edgeWidth = EDGE_WIDTH * zoom / (canvas.width / canvasW);
   const sorted = sortedRods;
 
   for (let s = 0; s < sorted.length; s++) {
