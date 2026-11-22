@@ -46,8 +46,8 @@ zoom /= SCALE;
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.8';
-const DATE = '2026-11-21';
+const VERSION = '1.7.9';
+const DATE = '2026-11-22';
 
 /* ============================================================
  *  控制棒数据
@@ -234,7 +234,7 @@ const Bloom = (function () {
       vec4 scene = texture(uScene, vUV);
       vec3 bloom = texture(uBloom, vUV).rgb;
       ${BLOOM_TINT ? 'bloom *= ' + CB_TINT : ''}; 
-      ${FULL_BLOOM ? '' : 'b *= scene.a;'};
+      ${FULL_BLOOM ? '' : 'bloom *= scene.a;'};
       vec3 color = scene.rgb + bloom * uIntensity;
       float maxC = max(max(color.r, color.g), color.b);
       color *= (1.0 - smoothstep(1.0, 1.6, maxC) * 0.4);
@@ -1302,4 +1302,6 @@ update();
 /*
 api key:
 sk-kSOhklp8b45UNDqux5l1REaACn8djTOR
+很明显，这是假的（sk-kSOhklp8b45UNDqux5l1REaACn8djTOR ----> SOUNDREACTOR）
+有没有小天才去试试啊
 */
