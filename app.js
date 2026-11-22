@@ -30,7 +30,6 @@ let DOT_SEG = 8;
 let RING_STEP = 64;
 let DRAW_DOT = true; //绘制点
 let DRAW_EDGE = true; //绘制棱(边)
-let DRAW_SIDE = [1,1,1,1,1]; //绘制面 可以改为[0,0,1,1,1]，且画面差异较小
 let LOOP = true;
 let MAX_VERTS = 100000;
 let FBO_SS = 2; //SCALE调大时可以适当减少
@@ -46,7 +45,7 @@ zoom /= SCALE;
 /* ============================================================
  *  版本
  * ============================================================ */
-const VERSION = '1.7.9';
+const VERSION = '1.7.10';
 const DATE = '2026-11-22';
 
 /* ============================================================
@@ -731,23 +730,22 @@ function buildGeometry() {
     const b = project(x + half, z - half, h);
     const c = project(x + half, z + half, h);
     const d = project(x - half, z + half, h);
-
-    if (DRAW_SIDE[0] == true) pushQuad(a, b, b0, a0, COL.side1);
-    if (DRAW_SIDE[1] == true) pushQuad(b, c, c0, b0, rgb(55 + amp * 30, 62 + amp * 30, 44 + amp * 20));
-    if (DRAW_SIDE[2] == true) pushQuad(c, d, d0, c0, COL.side3);
-    if (DRAW_SIDE[3] == true) pushQuad(d, a, a0, d0, COL.side4);
-
+    
+    const showSide0 = cosA < 0;
+    const showSide1 = sinA > 0;
+    const showSide2 = cosA > 0;
+    const showSide3 = sinA < 0;
+    
     const seed = rod.seed;
     const top = seed > 0.92 ? [143, 109, 81]
               : seed > 0.85 ? [97, 118, 104]
               : [139 + seed * 29, 148 + seed * 22, 119 + seed * 21];
-    if (DRAW_SIDE[4] == true){
-      pushQuad(a, b, c, d, rgb(
-        top[0] + amp * 43,
-        top[1] + amp * 40,
-        top[2] + amp * 24
-      ));
-    };
+
+    if (showSide0) pushQuad(a, b, b0, a0, COL.side1);
+    if (showSide1) pushQuad(b, c, c0, b0, rgb(55 + amp * 30, 62 + amp * 30, 44 + amp * 20));
+    if (showSide2) pushQuad(c, d, d0, c0, COL.side3);
+    if (showSide3) pushQuad(d, a, a0, d0, COL.side4);
+                   pushQuad(a, b, c, d, rgb(top[0] + amp * 43,top[1] + amp * 40,top[2] + amp * 24));;
     
     if (DRAW_EDGE){
       pushEdge(a, b, COL.edge, edgeWidth);
