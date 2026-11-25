@@ -1296,10 +1296,3 @@ $('version').textContent = 'v' + VERSION + ' ' + DATE;
 $('scale').textContent = SCALE + 'x'
 
 update();
-
-/*
-api key:
-sk-kSOhklp8b45UNDqux5l1REaACn8djTOR
-很明显，这是假的（sk-kSOhklp8b45UNDqux5l1REaACn8djTOR ----> SOUNDREACTOR）
-有没有小天才去试试啊
-*/
